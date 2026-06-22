@@ -1,6 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import sys
 import os
 from datetime import datetime, timedelta
@@ -21,8 +22,26 @@ try:
 except ImportError:
     print("⚠️ 无法导入Kronos模型，预测功能将不可用")
 
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+# 设置中文字体（跨平台健壮处理：自动从候选字体中挑选系统已安装的字体）
+import matplotlib.font_manager as fm
+
+# 候选中文字体优先级列表，覆盖 Windows / Linux / macOS 常见中文字体
+_PREFERRED_CN_FONTS = [
+    'SimHei', 'Microsoft YaHei',                       # Windows
+    'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',        # Linux (文泉驿)
+    'Noto Sans CJK SC', 'Source Han Sans SC', 'Source Han Sans CN',  # Linux (思源黑体/Noto)
+    'PingFang SC', 'Heiti SC', 'STHeiti', 'Arial Unicode MS',        # macOS
+]
+_available_fonts = {f.name for f in fm.fontManager.ttflist}
+_chosen_cn_fonts = [name for name in _PREFERRED_CN_FONTS if name in _available_fonts]
+if _chosen_cn_fonts:
+    # 将已安装的中文字体放在最前面，保证中文标签正常显示
+    plt.rcParams['font.sans-serif'] = _chosen_cn_fonts + ['DejaVu Sans']
+else:
+    # 未检测到任何中文字体时给出明确提示（Linux 服务器常见，需要手动安装字体）
+    print("⚠️ 未检测到可用中文字体，图表中文可能显示为方块。"
+          "可在 Linux 上安装：apt-get install fonts-wqy-microhei 或 fonts-noto-cjk")
+    plt.rcParams['font.sans-serif'] = _PREFERRED_CN_FONTS + ['DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 
 
@@ -405,7 +424,14 @@ class EnhancedMarketFactorAnalyzer:
                 print(f"  分析{index_name}({index_code})...")
 
                 # 获取指数数据
-                index_df = ak.stock_zh_index_hist(symbol=index_code, period="daily")
+                # 注意：akshare 中并不存在 stock_zh_index_hist 接口，应使用 index_zh_a_hist 获取指数历史行情。
+                # 取最近一年数据（需满足 ma60 计算所需的至少 60 个交易日）。
+                _end_date = datetime.now().strftime('%Y%m%d')
+                _start_date = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
+                index_df = ak.index_zh_a_hist(
+                    symbol=index_code, period="daily",
+                    start_date=_start_date, end_date=_end_date
+                )
 
                 if index_df is None or index_df.empty:
                     print(f"  ❌ 无法获取{index_name}数据")
@@ -1176,7 +1202,11 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
 
         # 3. 实例化预测器
         print("步骤3: 初始化预测器...")
-        predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+        # 自动检测设备：有 GPU 则用 cuda:0，否则回退到 cpu（避免在无 GPU 环境下报错）
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        print(f"模型已成功加载到设备: {device}")
+        predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
         print("✅ 预测器初始化完成")
 
         # 4. 准备数据
@@ -1195,8 +1225,10 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
 
         # 6. 准备输入数据
         print("步骤6: 准备输入数据...")
-        x_df = df.loc[-lookback:, ['open', 'high', 'low', 'close', 'volume', 'amount']].reset_index(drop=True)
-        x_timestamp = df.loc[-lookback:, 'timestamps'].reset_index(drop=True)
+        # 注意：df 使用默认 RangeIndex（0..N-1），取「最近 lookback 条」必须用 .iloc 位置索引；
+        # 若用 .loc[-lookback:] 会被当作标签切片，因所有标签均 >= -lookback 而返回整个 DataFrame。
+        x_df = df.iloc[-lookback:][['open', 'high', 'low', 'close', 'volume', 'amount']].reset_index(drop=True)
+        x_timestamp = df.iloc[-lookback:]['timestamps'].reset_index(drop=True)
 
         # 生成未来日期
         last_historical_date = df['timestamps'].iloc[-1]
@@ -1226,7 +1258,7 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
         # 8. 使用多维度市场因素增强预测
         print("步骤8: 应用多维度市场因素增强预测...")
         enhanced_pred_df, enhancement_info = enhance_prediction_with_market_factors(
-            df.loc[-lookback:].reset_index(drop=True),
+            df.iloc[-lookback:].reset_index(drop=True),
             pred_df,
             stock_code,
             market_analyzer
@@ -1238,9 +1270,14 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
         # 9. 创建综合市场分析报告
         market_report = create_comprehensive_market_report(enhancement_info, output_dir, stock_code)
 
+        # 将分析总结回写到 enhancement_info，供后续报告与可视化复用
+        # （analysis_summary 由 create_comprehensive_market_report 生成并保存在 market_report 中，
+        #   此处同步回 enhancement_info，避免后续访问 enhancement_info['analysis_summary'] 时报 KeyError）
+        enhancement_info['analysis_summary'] = market_report['analysis_summary']
+
         # 10. 可视化结果
         print("步骤9: 生成综合版可视化图表...")
-        historical_df = df.loc[-lookback:].reset_index(drop=True)
+        historical_df = df.iloc[-lookback:].reset_index(drop=True)
         hist_prices, base_pred_prices = plot_comprehensive_prediction(
             historical_df, pred_df, future_dates, stock_code, stock_name, output_dir, enhancement_info
         )
@@ -1307,9 +1344,9 @@ def main():
     STOCK_CONFIG = {
         "stock_code": "603288",
         "stock_name": "海天味业",
-        "data_dir": r"D:\lianghuajiaoyi\Kronos\examples\data",
+        "data_dir": r"examples\data",
         "pred_days": 60,
-        "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce",
+        "output_dir": r"examples\yuce",
         "history_years": 1
     }
 

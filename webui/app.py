@@ -58,21 +58,37 @@ AVAILABLE_MODELS = {
 }
 
 def load_data_files():
-    """Scan data directory and return available data files"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+    """Scan data directories and return available data files"""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # 扫描多个候选目录：项目根的 data/ 以及 examples/data/
+    candidate_dirs = [
+        os.path.join(project_root, 'data'),
+        os.path.join(project_root, 'examples', 'data'),
+    ]
+
+    # 确保默认 data 目录存在，避免首次使用时目录缺失导致下拉为空
+    os.makedirs(candidate_dirs[0], exist_ok=True)
+
     data_files = []
-    
-    if os.path.exists(data_dir):
+    seen_paths = set()
+
+    for data_dir in candidate_dirs:
+        if not os.path.isdir(data_dir):
+            continue
         for file in os.listdir(data_dir):
             if file.endswith(('.csv', '.feather')):
                 file_path = os.path.join(data_dir, file)
+                if file_path in seen_paths:
+                    continue
+                seen_paths.add(file_path)
                 file_size = os.path.getsize(file_path)
                 data_files.append({
                     'name': file,
                     'path': file_path,
                     'size': f"{file_size / 1024:.1f} KB" if file_size < 1024*1024 else f"{file_size / (1024*1024):.1f} MB"
                 })
-    
+
     return data_files
 
 def load_data_file(file_path):
@@ -230,7 +246,7 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
         high=historical_df['high'],
         low=historical_df['low'],
         close=historical_df['close'],
-        name='Historical Data (400 data points)',
+        name='历史数据（400 个数据点）',
         increasing_line_color='#26A69A',
         decreasing_line_color='#EF5350'
     ))
@@ -258,7 +274,7 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
             high=pred_df['high'],
             low=pred_df['low'],
             close=pred_df['close'],
-            name='Prediction Data (120 data points)',
+            name='预测数据（120 个数据点）',
             increasing_line_color='#66BB6A',
             decreasing_line_color='#FF7043'
         ))
@@ -291,16 +307,16 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
             high=actual_df['high'],
             low=actual_df['low'],
             close=actual_df['close'],
-            name='Actual Data (120 data points)',
+            name='实际数据（120 个数据点）',
             increasing_line_color='#FF9800',
             decreasing_line_color='#F44336'
         ))
     
     # Update layout
     fig.update_layout(
-        title='Kronos Financial Prediction Results - 400 Historical Points + 120 Prediction Points vs 120 Actual Points',
-        xaxis_title='Time',
-        yaxis_title='Price',
+        title='Kronos 金融预测结果 - 400 个历史数据点 + 120 个预测数据点 vs 120 个实际数据点',
+        xaxis_title='时间',
+        yaxis_title='价格',
         template='plotly_white',
         height=600,
         showlegend=True
@@ -346,7 +362,7 @@ def load_data():
         file_path = data.get('file_path')
         
         if not file_path:
-            return jsonify({'error': 'File path cannot be empty'}), 400
+            return jsonify({'error': '文件路径不能为空'}), 400
         
         df, error = load_data_file(file_path)
         if error:
@@ -355,7 +371,7 @@ def load_data():
         # Detect data time frequency
         def detect_timeframe(df):
             if len(df) < 2:
-                return "Unknown"
+                return "未知"
             
             time_diffs = []
             for i in range(1, min(10, len(df))):  # Check first 10 time differences
@@ -363,20 +379,20 @@ def load_data():
                 time_diffs.append(diff)
             
             if not time_diffs:
-                return "Unknown"
+                return "未知"
             
             # Calculate average time difference
             avg_diff = sum(time_diffs, pd.Timedelta(0)) / len(time_diffs)
             
             # Convert to readable format
             if avg_diff < pd.Timedelta(minutes=1):
-                return f"{avg_diff.total_seconds():.0f} seconds"
+                return f"{avg_diff.total_seconds():.0f} 秒"
             elif avg_diff < pd.Timedelta(hours=1):
-                return f"{avg_diff.total_seconds() / 60:.0f} minutes"
+                return f"{avg_diff.total_seconds() / 60:.0f} 分钟"
             elif avg_diff < pd.Timedelta(days=1):
-                return f"{avg_diff.total_seconds() / 3600:.0f} hours"
+                return f"{avg_diff.total_seconds() / 3600:.0f} 小时"
             else:
-                return f"{avg_diff.days} days"
+                return f"{avg_diff.days} 天"
         
         # Return data information
         data_info = {
@@ -395,11 +411,11 @@ def load_data():
         return jsonify({
             'success': True,
             'data_info': data_info,
-            'message': f'Successfully loaded data, total {len(df)} rows'
+            'message': f'数据加载成功，共 {len(df)} 行'
         })
         
     except Exception as e:
-        return jsonify({'error': f'Failed to load data: {str(e)}'}), 500
+        return jsonify({'error': f'数据加载失败: {str(e)}'}), 500
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
@@ -416,7 +432,7 @@ def predict():
         sample_count = int(data.get('sample_count', 1))
         
         if not file_path:
-            return jsonify({'error': 'File path cannot be empty'}), 400
+            return jsonify({'error': '文件路径不能为空'}), 400
         
         # Load data
         df, error = load_data_file(file_path)
@@ -424,7 +440,7 @@ def predict():
             return jsonify({'error': error}), 400
         
         if len(df) < lookback:
-            return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
+            return jsonify({'error': f'数据长度不足，至少需要 {lookback} 行'}), 400
         
         # Perform prediction
         if MODEL_AVAILABLE and predictor is not None:
@@ -448,7 +464,7 @@ def predict():
                     
                     # Ensure sufficient data: lookback + pred_len
                     if len(time_range_df) < lookback + pred_len:
-                        return jsonify({'error': f'Insufficient data from start time {start_dt.strftime("%Y-%m-%d %H:%M")}, need at least {lookback + pred_len} data points, currently only {len(time_range_df)} available'}), 400
+                        return jsonify({'error': f'从起始时间 {start_dt.strftime("%Y-%m-%d %H:%M")} 起数据不足，至少需要 {lookback + pred_len} 个数据点，当前仅有 {len(time_range_df)} 个'}), 400
                     
                     # Use first lookback data points within selected window for prediction
                     x_df = time_range_df.iloc[:lookback][required_cols]
@@ -462,13 +478,13 @@ def predict():
                     end_timestamp = time_range_df['timestamps'].iloc[lookback+pred_len-1]
                     time_span = end_timestamp - start_timestamp
                     
-                    prediction_type = f"Kronos model prediction (within selected window: first {lookback} data points for prediction, last {pred_len} data points for comparison, time span: {time_span})"
+                    prediction_type = f"Kronos 模型预测（选定窗口内：前 {lookback} 个数据点用于预测，后 {pred_len} 个数据点用于对比，时间跨度：{time_span}）"
                 else:
                     # Use latest data
                     x_df = df.iloc[:lookback][required_cols]
                     x_timestamp = df.iloc[:lookback]['timestamps']
                     y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
-                    prediction_type = "Kronos model prediction (latest data)"
+                    prediction_type = "Kronos 模型预测（最新数据）"
                 
                 # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
                 if isinstance(x_timestamp, pd.DatetimeIndex):
@@ -487,9 +503,9 @@ def predict():
                 )
                 
             except Exception as e:
-                return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
+                return jsonify({'error': f'Kronos 模型预测失败: {str(e)}'}), 500
         else:
-            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
+            return jsonify({'error': 'Kronos 模型尚未加载，请先加载模型'}), 400
         
         # Prepare actual data for comparison (if exists)
         actual_data = []
@@ -617,11 +633,11 @@ def predict():
             'prediction_results': prediction_results,
             'actual_data': actual_data,
             'has_comparison': len(actual_data) > 0,
-            'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
+            'message': f'预测完成，共生成 {pred_len} 个预测点' + (f'，包含 {len(actual_data)} 个实际数据点用于对比' if len(actual_data) > 0 else '')
         })
         
     except Exception as e:
-        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+        return jsonify({'error': f'预测失败: {str(e)}'}), 500
 
 @app.route('/api/load-model', methods=['POST'])
 def load_model():
@@ -630,14 +646,14 @@ def load_model():
     
     try:
         if not MODEL_AVAILABLE:
-            return jsonify({'error': 'Kronos model library not available'}), 400
+            return jsonify({'error': 'Kronos 模型库不可用'}), 400
         
         data = request.get_json()
         model_key = data.get('model_key', 'kronos-small')
         device = data.get('device', 'cpu')
         
         if model_key not in AVAILABLE_MODELS:
-            return jsonify({'error': f'Unsupported model: {model_key}'}), 400
+            return jsonify({'error': f'不支持的模型: {model_key}'}), 400
         
         model_config = AVAILABLE_MODELS[model_key]
         
@@ -650,7 +666,7 @@ def load_model():
         
         return jsonify({
             'success': True,
-            'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {device}',
+            'message': f'模型加载成功: {model_config["name"]} ({model_config["params"]})，设备: {device}',
             'model_info': {
                 'name': model_config['name'],
                 'params': model_config['params'],
@@ -660,7 +676,7 @@ def load_model():
         })
         
     except Exception as e:
-        return jsonify({'error': f'Model loading failed: {str(e)}'}), 500
+        return jsonify({'error': f'模型加载失败: {str(e)}'}), 500
 
 @app.route('/api/available-models')
 def get_available_models():
@@ -678,7 +694,7 @@ def get_model_status():
             return jsonify({
                 'available': True,
                 'loaded': True,
-                'message': 'Kronos model loaded and available',
+                'message': 'Kronos 模型已加载并可用',
                 'current_model': {
                     'name': predictor.model.__class__.__name__,
                     'device': str(next(predictor.model.parameters()).device)
@@ -688,13 +704,13 @@ def get_model_status():
             return jsonify({
                 'available': True,
                 'loaded': False,
-                'message': 'Kronos model available but not loaded'
+                'message': 'Kronos 模型可用但尚未加载'
             })
     else:
         return jsonify({
             'available': False,
             'loaded': False,
-            'message': 'Kronos model library not available, please install related dependencies'
+            'message': 'Kronos 模型库不可用，请安装相关依赖'
         })
 
 if __name__ == '__main__':

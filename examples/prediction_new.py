@@ -19,12 +19,12 @@ warnings.filterwarnings('ignore')
 sys.path.append("../")
 try:
     from model import Kronos, KronosTokenizer, KronosPredictor
-except ImportError:
-    print("⚠️ 无法导入Kronos模型，预测功能将不可用")
-
-# 设置中文字体（跨平台健壮处理：自动从候选字体中挑选系统已安装的字体）
+except ImportError as e:
+    # 打印真实的导入错误（如缺少 huggingface_hub / einops 等依赖），
+    # 避免后续出现误导性的 "name 'KronosTokenizer' is not defined"。
+    print(f"⚠️ 无法导入Kronos模型，预测功能将不可用: {e}")
+    print("   请先安装依赖: pip install -r requirements.txt")
 import matplotlib.font_manager as fm
-
 # 候选中文字体优先级列表，覆盖 Windows / Linux / macOS 常见中文字体
 _PREFERRED_CN_FONTS = [
     'SimHei', 'Microsoft YaHei',                       # Windows
@@ -285,6 +285,11 @@ def prepare_stock_data(csv_file_path, stock_code, history_years=1):
         df = df[df['timestamps'] >= cutoff_date]
         print(f"📅 使用最近 {history_years} 年数据: {len(df)} 条记录 (从 {original_count} 条中筛选)")
 
+    if df.empty:
+        raise ValueError(
+            f"股票 {stock_code} 在当前历史年限筛选后没有可用数据，请检查数据文件或调整 history_years 参数"
+        )
+
     # 数据验证
     print(f"🔍 数据验证 - 最近5个交易日收盘价:")
     recent_prices = df[['timestamps', 'close']].tail()
@@ -304,6 +309,9 @@ def calculate_prediction_parameters(df, target_days=60):
     """
     根据目标预测天数计算合适的参数
     """
+    if df is None or df.empty:
+        raise ValueError("输入数据为空，无法计算预测参数")
+
     # 计算平均交易日数量
     total_days = (df['timestamps'].max() - df['timestamps'].min()).days
     trading_days = len(df)
@@ -312,14 +320,18 @@ def calculate_prediction_parameters(df, target_days=60):
     # 计算目标预测的交易日数量
     pred_trading_days = int(target_days * trading_ratio)
 
-    # 设置回看期数
-    max_lookback = int(len(df) * 0.7)
-    lookback = min(pred_trading_days * 3, max_lookback, len(df) - pred_trading_days)
-    pred_len = min(pred_trading_days, len(df) - lookback)
+    # 设置回看期数：对短样本自适应降级，避免 lookback/pred_len 超出可用数据范围
+    max_lookback = max(1, min(int(len(df) * 0.7), 400, len(df) - 1))
+    min_lookback = min(100, max(20, len(df) // 2))
+    lookback = min(max(min_lookback, pred_trading_days * 3), max_lookback)
 
-    # 确保参数在合理范围内
-    lookback = max(100, min(lookback, 400))
-    pred_len = max(20, min(pred_len, 120))
+    # 预测长度至少为 1，并且不能超过剩余历史长度
+    remaining_points = max(1, len(df) - lookback)
+    pred_len = min(max(1, pred_trading_days), 120, remaining_points)
+
+    # 进一步保证参数合法
+    lookback = max(1, min(lookback, len(df) - 1))
+    pred_len = max(1, min(pred_len, len(df) - lookback))
 
     print(f"📊 参数计算:")
     print(f"  目标预测天数: {target_days} 天（自然日）")
@@ -864,7 +876,8 @@ def create_comprehensive_market_report(enhancement_info, output_dir, stock_code)
         'analysis_summary': generate_analysis_summary(enhancement_info)
     }
 
-    # 保存报告
+    # 保存报告（先确保输出目录存在，避免 FileNotFoundError）
+    ensure_output_directory(output_dir)
     report_file = os.path.join(output_dir, f'{stock_code}_comprehensive_analysis_report.json')
     with open(report_file, 'w', encoding='utf-8') as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
@@ -1113,13 +1126,13 @@ def plot_comprehensive_prediction(
 
         summary_text = f"""市场状态总结:
 
-大盘趋势: {market_status}
-板块热度: {sector_status}
-宏观环境: {macro_status}
-美国利率: {enhancement_info['macro_analysis']['us_rate_cycle']['trend']}
-综合评分: {enhancement_info['adjustment_factor']:.3f}
+            大盘趋势: {market_status}
+            板块热度: {sector_status}
+            宏观环境: {macro_status}
+            美国利率: {enhancement_info['macro_analysis']['us_rate_cycle']['trend']}
+            综合评分: {enhancement_info['adjustment_factor']:.3f}
 
-投资建议: {enhancement_info['fundamental_analysis']['investment_rating']}"""
+            投资建议: {enhancement_info['fundamental_analysis']['investment_rating']}"""
 
         ax5.text(0.1, 0.9, summary_text, transform=ax5.transAxes, fontsize=10,
                  verticalalignment='top', linespacing=1.5)
@@ -1140,13 +1153,13 @@ def plot_comprehensive_prediction(
                 'main_risks'] else "• 风险可控"
 
             detail_text = f"""关键驱动因素:
-{drivers_text}
+                {drivers_text}
 
-主要风险提示:
-{risks_text}
+                主要风险提示:
+                {risks_text}
 
-总体情绪: {summary['overall_sentiment']}
-建议: {summary['investment_suggestion']}"""
+                总体情绪: {summary['overall_sentiment']}
+                建议: {summary['investment_suggestion']}"""
 
             ax6.text(0.02, 0.95, detail_text, transform=ax6.transAxes, fontsize=9,
                      verticalalignment='top', linespacing=1.3)
@@ -1165,7 +1178,12 @@ def plot_comprehensive_prediction(
     plt.savefig(chart_filename, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"📊 综合预测图表已保存: {chart_filename}")
 
-    plt.show()
+    # 默认不弹出窗口，避免在终端/无图形环境中阻塞。
+    # 如需交互显示，可设置环境变量 KRONOS_SHOW_PLOT=1。
+    if os.environ.get("KRONOS_SHOW_PLOT", "0") == "1":
+        print("🖼️ 正在显示图表窗口，关闭窗口后流程继续...")
+        plt.show()
+    plt.close(fig)
 
     return historical_prices, prediction_prices
 
@@ -1192,13 +1210,21 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
         # 2. 加载模型和分词器
         print("\n步骤2: 加载Kronos模型和分词器...")
         try:
+            # 优先从 HuggingFace 加载
             tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
             model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
-            print("✅ 模型加载完成 - 使用Kronos-base模型")
+            print("✅ 模型加载完成 - 使用Kronos-base模型 (HuggingFace)")
         except Exception as e:
-            print(f"❌ 模型加载失败: {e}")
-            print("⚠️ 预测功能不可用，请检查模型安装")
-            return
+            print(f"⚠️ HuggingFace 加载失败: {e}")
+            print("🔄 尝试从 ModelScope (魔搭) 回退加载...")
+            try:
+                tokenizer = KronosTokenizer.from_modelscope("AI-ModelScope/Kronos-Tokenizer-base")
+                model = Kronos.from_modelscope("AI-ModelScope/Kronos-base")
+                print("✅ 模型加载完成 - 使用Kronos-base模型 (ModelScope)")
+            except Exception as e2:
+                print(f"❌ 模型加载失败 (HuggingFace 与 ModelScope 均失败): {e2}")
+                print("⚠️ 预测功能不可用，请检查网络或模型安装")
+                return
 
         # 3. 实例化预测器
         print("步骤3: 初始化预测器...")
@@ -1341,12 +1367,13 @@ def main():
     主函数：综合版Kronos模型股票预测系统
     """
     # ==================== 配置参数 ====================
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     STOCK_CONFIG = {
-        "stock_code": "603288",
-        "stock_name": "海天味业",
-        "data_dir": r"examples\data",
+        "stock_code": "000807",
+        "stock_name": "云铝股份",
+        "data_dir": os.path.join(script_dir, "data"),
         "pred_days": 60,
-        "output_dir": r"examples\yuce",
+        "output_dir": os.path.join(script_dir, "yuce"),
         "history_years": 1
     }
 

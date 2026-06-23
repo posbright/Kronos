@@ -228,6 +228,30 @@ alpha = 0.6
 signal = alpha * sig_k + (1 - alpha) * sig_f
 ```
 
+### 步骤 3c：C1 vs C2 对比验证（结论）
+
+`finetune_csv/compare_fusion_strategies.py`（仓库已提供可运行版本，含 `--smoke` 自测：`python finetune_csv/compare_fusion_strategies.py --smoke`）在**同一份融合数据**上同时跑 C1、C2（加权）、C2（stacking），在 train 训基模型、val 调组合器、test 评估，输出 RMSE / IC / RankIC / 方向命中率并自动给出最优方案（下游模型优先 LightGBM，未安装则回退 numpy Ridge）。
+
+真实使用：
+
+```bash
+python finetune_csv/compare_fusion_strategies.py \
+    --train data/fusion_train.csv --val data/fusion_val.csv --test data/fusion_test.csv \
+    --kronos-cols k_pred_ret,k_up_prob,k_pred_vol \
+    --factor-cols pe,pb,roe,north_hold,news_sent,news_count,event_flag \
+    --label label_fwd_ret_5d
+```
+
+**结论（理论 + 合成数据实证一致）**：
+
+| 场景 | 推荐 |
+| --- | --- |
+| 样本充足、因子与价量存在**交互效应**（A 股日频常见） | **C1 特征融合**（能吃到 `k_pred_ret × roe` 等交叉项，上限更高）⭐ |
+| 样本少 / 因子异频稀疏（尤其消息面）/ 要求线上极稳可快速降级 | **C2 信号集成**（自由度小、最稳健，stacking 优于纯加权） |
+| 工程最佳实践 | **以 C1 为主线**，C2（尤其 stacking）作为对照与兜底集成 |
+
+> 在含交互项的合成数据上实测：C1 的 test IC 最高（C1 > C2-stacking > C2-加权），印证「有交互信号时 C1 上限更高」。**最终以你真实数据上该脚本的 val/test 指标为准**——把 `fusion_*.csv` 传入即可得到针对你数据的结论。
+
 ---
 
 ## 4. 验证与评估

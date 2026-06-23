@@ -306,8 +306,19 @@ def prepare_stock_data(csv_file_path, stock_code, history_years=1):
 
 
 def calculate_prediction_parameters(df, target_days=60):
-    """
-    根据目标预测天数计算合适的参数
+    """根据目标预测天数自动推导 lookback（回看长度）与 pred_len（预测步数）。
+
+    参数说明 / 最优解 / 影响：
+      - target_days：希望预测的「自然日」跨度，会按交易日占比折算成 pred_len。
+          · 最优：日线建议 ≤ 30（约 1 个月）效果最佳；30~90 仅看趋势；>90 基本是噪声。
+          · 影响：越大 -> 自回归步数越多 -> 误差累积越严重、越发散。
+      - lookback（函数内推导）：喂给模型的历史 K 线根数。
+          · 最优：200~400，且必须满足 lookback + pred_len ≤ max_context(512)；
+            一般取 pred_len 的 3~10 倍（本函数用 pred_trading_days*3 作下限）。
+          · 影响：太短 -> 上下文不足、欠拟合；太长（>512）-> 早期历史被滑出窗口、变慢。
+      - pred_len（函数内推导）：自回归生成的步数 = 实际预测的交易日数。
+          · 最优：5~20 步信号最强；本函数硬上限 120，且不超过剩余可用历史。
+          · 影响：与 target_days 同向，越大越不可靠，远端建议改用周/月线或多采样取分位数。
     """
     if df is None or df.empty:
         raise ValueError("输入数据为空，无法计算预测参数")
@@ -1189,9 +1200,25 @@ def plot_comprehensive_prediction(
 
 
 # ==================== 主预测函数 ====================
-def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_days, output_dir, history_years=1):
-    """
-    运行综合版Kronos模型预测流程
+def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_days, output_dir,
+                                        history_years=1, T=1.0, top_p=0.9, top_k=0,
+                                        sample_count=1, max_context=512, clip=5):
+    """运行综合版 Kronos 模型预测流程。
+
+    参数说明 / 最优解 / 影响：
+      - stock_code / stock_name：标的代码与名称（取数 + 展示）。
+      - data_dir：原始/缓存数据目录；output_dir：图表与报告输出目录。
+      - pred_days：目标预测自然日数。最优 ≤30（约 1 个月）；30~90 仅看趋势；>90 退化为噪声。
+                   影响：越大 -> 自回归步数越多 -> 误差累积越严重、越慢。
+      - history_years：回看年限。最优 1~3 年（日线足够支撑 lookback≤512 的上下文）；
+                       太短上下文不足，太长多为过时行情、对近期预测帮助有限。
+      - T（温度，默认 1.0）：采样随机性。<1 更确定/平滑，>1 更发散。最优 0.6~1.0。
+      - top_p（核采样，默认 0.9）：累计概率阈。最优 0.9~0.95；过高引入长尾噪声。
+      - top_k（默认 0=关闭）：仅保留概率最高的 k 个候选；与 top_p 二选一。
+      - sample_count（默认 1）：蒙特卡洛采样路径数，取均值。求稳建议 20~50（耗时线性增加）。
+      - max_context（默认 512）：单次最大序列长。Kronos-base 预训练=512，最优保持 512；
+                     >512 属 RoPE 外推且显存 O(L²) 上升。
+      - clip（默认 5）：z-score 标准化后的截断阈。最优 3~5；过小削弱真实波动。
     """
     print(f"\n🎯 开始 {stock_name}({stock_code}) 综合版Kronos模型价格预测")
     print("=" * 60)
@@ -1232,7 +1259,11 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         model = model.to(device)
         print(f"模型已成功加载到设备: {device}")
-        predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+        # max_context / clip 由入参传入（可在 STOCK_CONFIG 统一配置）：
+        #   max_context：单次可处理的最大序列长，Kronos-base 预训练=512，最优保持 512。
+        #   clip：z-score 标准化后的截断阈，最优 3~5。
+        predictor = KronosPredictor(model, tokenizer, device=device,
+                                    max_context=max_context, clip=clip)
         print("✅ 预测器初始化完成")
 
         # 4. 准备数据
@@ -1266,14 +1297,18 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
 
         # 7. 执行基础预测
         print("步骤7: 执行基础价格预测...")
+        # predict 采样参数由入参传入（可在 STOCK_CONFIG 统一调参）：
+        #   T（0.6~1.0）：温度，越低越确定/平滑；top_p（0.9~0.95）：核采样阈；
+        #   top_k（0=关闭）：与 top_p 二选一；sample_count：多路径取均，求稳可调 20~50。
         pred_df = predictor.predict(
             df=x_df,
             x_timestamp=x_timestamp,
             y_timestamp=pd.Series(future_dates),
             pred_len=pred_len,
-            T=1.0,
-            top_p=0.9,
-            sample_count=1,
+            T=T,
+            top_p=top_p,
+            top_k=top_k,
+            sample_count=sample_count,
             verbose=True
         )
 
@@ -1367,14 +1402,27 @@ def main():
     主函数：综合版Kronos模型股票预测系统
     """
     # ==================== 配置参数 ====================
+    # 各项含义 / 最优解 / 影响：
+    #   stock_code / stock_name：标的代码与名称，仅用于取数与展示。
+    #   data_dir / output_dir：数据缓存目录与结果输出目录。
+    #   pred_days：目标预测自然日跨度。最优 ≤30（约 1 个月）；越大误差累积越严重，>90 不建议。
+    #   history_years：取最近 N 年历史用于回看。最优 1~3 年（日线≈250~750 根，足够支撑 lookback≤512）；
+    #                  太短上下文不足，太长则多为过时行情、对近期预测帮助有限。
     script_dir = os.path.dirname(os.path.abspath(__file__))
     STOCK_CONFIG = {
-        "stock_code": "000807",
-        "stock_name": "云铝股份",
+        "stock_code": "300308",
+        "stock_name": "中际旭创",
         "data_dir": os.path.join(script_dir, "data"),
-        "pred_days": 60,
+        "pred_days": 60,            # 目标预测天数：最优 ≤30，>90 基本不可靠
         "output_dir": os.path.join(script_dir, "yuce"),
-        "history_years": 1
+        "history_years": 1,         # 回看年限：最优 1~3 年
+        # ---- 采样 / 上下文参数（统一调参）----
+        "T": 1.0,                   # 温度：0.6~1.0，越低越确定/平滑
+        "top_p": 0.9,               # 核采样：0.9~0.95
+        "top_k": 0,                 # 0=关闭；与 top_p 二选一
+        "sample_count": 1,          # 采样路径数：求稳可调 20~50 取均值
+        "max_context": 512,         # 最大上下文：最优=512（与预训练一致）
+        "clip": 5                   # 归一化截断阈：3~5
     }
 
     print("🤖 综合版Kronos模型股票价格预测系统")

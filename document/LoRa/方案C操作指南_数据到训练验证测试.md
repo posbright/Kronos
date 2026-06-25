@@ -23,7 +23,7 @@ flowchart TD
 | 步骤 | 脚本 | 产物 | 自测命令 |
 | --- | --- | --- | --- |
 | 1 数据准备 | —（你提供） | 价量 CSV、因子 CSV | — |
-| 2 生成 Kronos 特征 | `build_kronos_features.py` | `kronos_features_*.csv` | `... build_kronos_features.py --smoke` |
+| 2 生成 Kronos 特征 | `build_dataC_step2_kronos_features.py`（批量编排）<br/>`build_kronos_features.py`（单标的/底层） | `DataSet/dataC/kronos_features.csv` | `... build_kronos_features.py --smoke` |
 | 3 融合 + 切分 | `build_fusion_dataset.py` | `fusion_{all,train,val,test}.csv` | `... build_fusion_dataset.py --smoke` |
 | 4 数据自检 | 内联脚本（本文 4 节） | 校验通过 | — |
 | 5 选型 | `compare_fusion_strategies.py` | `fusion_selection.json` | `... compare_fusion_strategies.py --smoke` |
@@ -54,57 +54,224 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 
 ---
 
-## 2. 步骤 1：准备两类输入数据
+## 2. 步骤 1：从 Quantia cache / DB 自动构建价量 CSV 与因子 CSV（推荐）
 
-方案 C 需要**两份你自备的 CSV**（标签由脚本从价格自动计算，无需单独提供）。
+从本节开始，方案 C 第 1 步不再要求手工准备 CSV，直接使用脚本：
 
-### 2.1 价量 CSV（喂 Kronos）
+- `finetune_csv/build_dataC_step1_from_quantia.py`
 
-列固定为 `timestamps,open,high,low,close,volume,amount`：
+该脚本会按你的要求完成：
 
-```csv
-timestamps,open,high,low,close,volume,amount
-2020/01/02,16.50,16.78,16.40,16.72,98345600,1.64e9
-2020/01/03,16.70,16.95,16.61,16.88,76521000,1.29e9
+- 从 `C:/xapproject/Quantia/Quantia/quantia/cache/hist` 拉取全量价量（cache 优先）。
+- 以最新日期为锚点（可显式指定 `--anchor-date 2026-06-24`）向前回推切分 train/validation/test。
+- 输出到 `DataSet/dataC/{train,validation,test}/`，每个 split 含：
+    - `price.csv`：`date,symbol,open,high,low,close,volume,amount`
+    - `factors.csv`：`date,symbol,<factor...>`
+- 生成 `DataSet/dataC/split_report.json` 记录参数、时间边界、行数、标的数。
+
+### 2.1 一条命令构建（按 6/24 向前切分）
+
+```powershell
+.\.venv\Scripts\python.exe finetune_csv\build_dataC_step1_from_quantia.py `
+        --quantia-root C:/xapproject/Quantia/Quantia `
+        --cache-hist-root C:/xapproject/Quantia/Quantia/quantia/cache/hist `
+        --out-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+        --anchor-date 2026-06-24 `
+        --end-date 2026-06-24 `
+        --val-days 180 `
+        --test-days 180
 ```
 
-> 仓库自带样例可直接试跑：`examples/data/000807_stock_data.csv`、`finetune_csv/data/HK_ali_09988_kline_5min_all.csv`。
+    脚本默认会读取 `C:/xapproject/Quantia/Quantia/.env` 的 `QUANTIA_DB_*` 配置，并**优先使用远程 DB**。
+    当系统环境变量里有本地 DB 配置时，脚本会用项目 `.env` 覆盖当前进程，避免误连本地库。
 
-### 2.2 因子 CSV（基本面 / 消息面，可异频）
+    可先做连通性验证（不构建数据）：
 
-列含对齐键 `date,symbol` + 任意因子，缺失允许（后续按规则填充）：
+    ```powershell
+    .\.venv\Scripts\python.exe finetune_csv\build_dataC_step1_from_quantia.py `
+        --quantia-root C:/xapproject/Quantia/Quantia `
+        --check-db
+    ```
 
-```csv
-date,symbol,pe,pb,roe,north_hold,news_sent,news_count,event_flag
-2020-01-02,000001,9.85,0.92,0.121,3.10,0.20,12,0
-2020-01-03,000001,9.95,0.93,0.121,3.12,-0.05,8,0
+说明：
+
+- `--anchor-date`：切分锚点（你要求“从最新数据 6 月 24 日往后推”）。
+- `--test-days`：测试集回推天数。
+- `--val-days`：验证集回推天数。
+- 训练集默认取“更早的全部历史”（受 `--start-date` 限制，默认 `2017-01-01`）。
+
+### 2.2 数据来源优先级与缺失处理策略
+
+价量（price.csv）：
+
+1. **优先 cache**：`cache/hist/{prefix}/{symbol}qfq.gzip.pickle`
+2. cache 不可用时，**回退 DB**：`cn_stock_spot`（可通过 `--disable-db-fallback-kline` 关闭）
+
+因子（factors.csv）：
+
+1. cache 可直接提供列：`amplitude, quote_change, ups_downs, turnover`
+2. 本地可重算技术因子（默认开启）：`local_ret_1d/local_ma_5/...`（来自价量重算，**全历史可用**）
+3. DB 财务因子（默认开启，`fin_*`）：`cn_stock_financial`，按披露日 `report_date` 向后 `asof` 对齐到交易日。
+   该表**覆盖全历史（约 1988→2026）**，是历史训练区间唯一可靠的 DB 因子来源。
+   为避免逐股 4900+ 次串行查询，脚本会**一次性批量预取全市场财务因子**再按标的对齐（极快）。
+4. DB 技术指标（默认关闭，`tech_*`）：`cn_stock_indicators`。
+   **重要**：远程该表仅覆盖近月（约 `2026-02` 起），**无法覆盖 2017→2025 历史训练区间**，
+   因此默认关闭，历史技术因子统一由本地重算（`local_*`）提供。仅当你确需近月 DB 技术指标时，加 `--db-tech` 开启。
+5. 消息类缺失兜底：自动补 `news_sent/news_count/event_flag` 并填 0
+
+缺失值规则（不影响后续训练）：
+
+- 先按 `symbol` 做前向填充（防跨标的串值）。
+- 消息事件类缺失填 0。
+- 其他因子缺失用中位数兜底，再兜底 0。
+- 产出的 `price.csv/factors.csv` 默认无 NaN，可直接进入后续 C1 训练流程。
+
+### 2.3 参数化设计（便于后续接入 Quantia 项目）
+
+常用参数：
+
+- 路径：`--quantia-root`、`--cache-hist-root`、`--out-root`
+- 时间：`--start-date`、`--end-date`、`--anchor-date`、`--val-days`、`--test-days`
+- 规模：`--max-symbols`（0=全量）
+- 数据源开关：
+    - `--scan-db-symbols`
+    - `--disable-db-fallback-kline`
+    - `--disable-db-features`（一键禁用所有 DB 因子，仅 cache+本地重算）
+    - `--disable-local-recompute`
+    - `--db-financial` / `--no-db-financial`（DB 财务因子 `fin_*`，**默认开启**，全历史有效）
+    - `--db-tech` / `--no-db-tech`（DB 技术指标 `tech_*`，**默认关闭**，远程仅近月）
+- DB 节流与稳健性：`--db-sleep`、`--db-retries`
+- DB 覆盖与校验：`--prefer-remote-db`、`--db-host`、`--db-user`、`--db-password`、`--db-database`、`--db-port`、`--check-db`
+
+> **因子覆盖说明**：远程 `cn_stock_indicators`（技术指标）/`cn_stock_spot` 仅覆盖近月，
+> 历史训练区间（2017→2025）的技术因子由本地重算 `local_*` 提供；
+> `cn_stock_financial`（财务因子 `fin_*`）覆盖全历史，默认参与并按披露日 asof 对齐。
+
+你后续若接入 `C:/xapproject/Quantia/Quantia` 的不同环境，只需改参数，不需要改代码路径。
+
+### 2.4 输出目录结构
+
+```text
+DataSet/
+    dataC/
+        split_report.json
+        train/
+            price.csv
+            factors.csv
+        validation/
+            price.csv
+            factors.csv
+        test/
+            price.csv
+            factors.csv
 ```
 
-- 慢变因子（`pe/pb/roe/north_hold`）→ 对齐时**前向填充**。
-- 新闻 / 事件类（`news_sent/news_count/event_flag`）→ 缺失填 **0**。
-- **所有因子必须是「当日收盘前可得」**（防未来泄漏）。
+### 2.5 快速自检（建议每次构建后执行）
 
-> 没有现成因子？可先只用价量跑通：把因子 CSV 做成只含 `date,symbol` 两列（或几个简单因子），流程同样成立，C1 退化为只吃 Kronos 特征。
+推荐使用专用校验脚本（检查 schema / NaN / OHLC 一致性 / 行对齐 / 时间切分不重叠 / 因子覆盖）：
+
+```powershell
+.\.venv\Scripts\python.exe finetune_csv\examples\validate_dataC.py `
+    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+    --expect-anchor 2026-06-24
+```
+
+全部通过退出码为 0；存在失败项时退出码为 1 并打印失败清单。
+
+如需极简内联检查，也可：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import pandas as pd; \
+from pathlib import Path; root=Path('DataSet/dataC'); \
+for s in ['train','validation','test']:\
+ p=pd.read_csv(root/s/'price.csv', dtype={'symbol':str}); f=pd.read_csv(root/s/'factors.csv', dtype={'symbol':str});\
+ print(s,'price',len(p),p['date'].min(),p['date'].max(),'sym',p['symbol'].nunique());\
+ print(s,'factor',len(f),f['date'].min(),f['date'].max(),'sym',f['symbol'].nunique())"
+```
 
 ---
 
 ## 3. 步骤 2：用 Kronos 批量生成衍生特征
 
+方案 C 第 2 步把 Kronos 当**纯价量预测器**，对每个交易日用历史窗口多次采样预测，统计出三类衍生特征：
+
+- `k_pred_ret`：预测的 N 步收益率均值（多条采样路径均值）
+- `k_up_prob`：上涨概率（多条路径中收益 > 0 的比例）
+- `k_pred_vol`：预测不确定性（多条路径末值收益率标准差）
+
+### 3.1 推荐入口：编排脚本（对 dataC 子集批量生成）
+
+由于 Kronos 是**逐窗自回归**推理，CPU 上单次 `predict` 约 0.75s，全市场全历史不可行（20 只全历史 ≈ 11 天）。
+因此提供编排脚本 `build_dataC_step2_kronos_features.py`，对 dataC **随机子集 + 最近时间窗**批量生成，并支持**断点续跑**：
+
+```powershell
+.\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
+    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+    --max-symbols 10 --recent-days 120 `
+    --lookback 90 --pred 5 --samples 10 --seed 42
+```
+
+- `--max-symbols`：随机抽取的标的数（`--seed` 固定可复现）。
+- `--recent-days`：仅为每只标的**最近 N 个交易日**生成特征（控制总耗时）。
+- `--lookback`：历史窗口（**≤ 512**，受 `max_context` 限制）。
+- `--pred`：预测步数（与后续标签 `horizon` 对齐，常用 5）。
+- `--samples`：每窗采样次数（越大越稳但越慢）。
+- `--skip-existing`（默认开）：复用已生成的 part，**断点续跑**。
+- **产物**：
+    - `DataSet/dataC/kronos_features.csv`：`date,symbol,k_pred_ret,k_up_prob,k_pred_vol`
+    - `DataSet/dataC/_kronos_parts/{symbol}.csv`：逐只增量产物（中断不丢失，可续跑）
+    - `DataSet/dataC/kronos_features_report.json`：参数 / 设备 / 选中标的 / 每只耗时 / 行数
+
+> 耗时公式：**标的数 × 窗口数 × samples × 单次耗时**。CPU 单次 ≈ 0.75s；`sample_count` 批量采样无加速优势。
+> 每只标的窗口数 ≈ `recent_days + 1`。例：10 只 × 120 天 × samples=10 @CPU ≈ 2.5h。
+
+### 3.2 CPU / GPU 设备选择
+
+脚本通过 `--device` 选择设备，默认 `auto`（**优先 GPU → MPS → CPU** 自动检测）：
+
+```powershell
+# CPU（无 GPU 时 auto 即 CPU；也可显式 --device cpu）
+.\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
+    --data-root .../DataSet/dataC --max-symbols 10 --recent-days 120 --samples 10
+
+# GPU：显存足够时可放大规模（更多标的 / 更长时间窗 / 更高 samples）
+.\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
+    --device cuda:0 --max-symbols 100 --recent-days 500 --samples 30
+```
+
+- `--device auto`：CUDA 可用→`cuda:0`；否则 Apple `mps`；再否则 `cpu`。
+- `--device cuda:0`：强制 GPU；若环境无 CUDA 会**自动回退 CPU 并告警**。
+- `--device cpu`：强制 CPU，并自动 `set_num_threads` 用满核心。
+- 运行时会打印实际设备与按设备外推的预计耗时；`report.json` 记录 `device_resolved`。
+
+> **GPU 提速量级**：通常比 CPU 快 8~25 倍（取决于显卡）。脚本耗时外推内置经验值
+> `cpu≈0.75s/次、cuda≈0.05s/次、mps≈0.15s/次`，仅用于估算，真实以实测为准。
+>
+> **进一步提速（全市场全历史）**：本脚本仍是逐只逐窗串行推理。若要在 GPU 上扩展到全市场全历史，
+> 建议改用 `KronosPredictor.predict_batch`（[model/kronos.py](../../model/kronos.py)）做**多标的/多窗一次前向并行**——
+> 这是相对 `predict` 的真正提速点（注意 `predict_batch` 要求同批次 `lookback`/`pred_len` 完全一致）。
+
+### 3.3 单标的脚本（底层 / 调试用）
+
+编排脚本内部复用 `build_kronos_features.py` 的 `build_features`。如只想对单只 CSV 调试，可直接：
+
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py `
     --price-csv finetune_csv\data\A_000001_daily.csv `
-    --tokenizer pretrained\Kronos-Tokenizer-base `
-    --predictor pretrained\Kronos-base `
+    --tokenizer NeoQuasar/Kronos-Tokenizer-base `
+    --predictor NeoQuasar/Kronos-base `
     --out data\kronos_features_000001.csv `
     --symbol 000001 --lookback 90 --pred 5 --samples 30
 ```
 
-- `--lookback`：历史窗口（**≤ 512**，受 `max_context` 限制）。
-- `--pred`：预测步数（与后续标签 `horizon` 对齐，常用 5）。
-- `--samples`：每窗采样次数（越大越稳但越慢，30 起步）。
-- **产物**：`kronos_features_000001.csv`，每个交易日一行：`date,symbol,k_pred_ret,k_up_prob,k_pred_vol`。
+- 输入 CSV 需含 `timestamps + open/high/low/close/volume/amount`。
+- 该入口为**单标的、无断点续跑**；批量请用 3.1 的编排脚本。
 
-> 多只股票：每只各跑一次（`--symbol` 区分）后纵向拼接；或改用 `KronosPredictor.predict_batch` 自行扩展提速。
+### 3.4 冒烟自测
+
+```powershell
+.\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py --smoke
+```
 
 ---
 
@@ -112,9 +279,9 @@ date,symbol,pe,pb,roe,north_hold,news_sent,news_count,event_flag
 
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\build_fusion_dataset.py `
-    --kronos data\kronos_features_000001.csv `
-    --factors data\factors_000001.csv `
-    --price finetune_csv\data\A_000001_daily.csv `
+    --kronos DataSet\dataC\kronos_features.csv `
+    --factors DataSet\dataC\test\factors.csv `
+    --price DataSet\dataC\test\price.csv `
     --out-dir data `
     --horizon 5 --train-end 2024-01-01 --val-end 2025-01-01
 ```

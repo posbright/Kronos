@@ -183,7 +183,9 @@ te.to_csv("data/fusion_test.csv", index=False)
 print(len(tr), len(va), len(te))
 ```
 
-### 步骤 3a（C1）：训练下游融合模型（LightGBM 回归）
+### 步骤 3a（C1，主线）：训练下游融合模型（LightGBM 回归）
+
+> C1 特征融合是**工程主线**：把 Kronos 衍生特征 ⊕ 因子特征喂给单个下游模型，能吃到 `k_pred_ret × roe` 等交叉项。下面是底层原理示意，步骤 3c 的脚本已将其与 C2 兜底、自动选型一并封装。
 
 ```python
 import numpy as np, pandas as pd, lightgbm as lgb
@@ -212,25 +214,16 @@ print("方向命中率:", ((pred > 0) == (te[tgt] > 0)).mean())
 print(dict(zip(feat, model.feature_importances_)))
 ```
 
-### 步骤 3b（C2）：信号集成（加权 / stacking）
+> C2（信号集成）作为**对照与兜底**，不必手写——已封装进步骤 3c 的脚本：Kronos 单独出一路预测、因子单独出一路预测，再用「加权（val 上搜 alpha）」或「stacking（val 上训线性元模型）」融合。**所有组合器参数只在验证集上确定**，无需也不应手动准备 `factor_score` 等列。
 
-```python
-import numpy as np
-# Kronos 单独信号（上涨概率 -> [-1,1] 方向分）
-sig_k = (te["k_up_prob"].values - 0.5) * 2
-# 因子单独信号：需另有一列 factor_score（你的多因子打分模型输出，标准化到 [-1,1]）。
-# 若 fusion_*.csv 中没有该列，可先用现有因子线性合成一个临时打分，例如：
-#   from sklearn.preprocessing import scale  # 或自行做 z-score
-#   te = te.assign(factor_score=np.tanh(0.5*scale(te["roe"]) - 0.5*scale(te["pe"])))
-sig_f = te["factor_score"].values
-# 简单加权（权重 alpha 只能在验证集上搜索，禁止在测试集上调参）
-alpha = 0.6
-signal = alpha * sig_k + (1 - alpha) * sig_f
-```
+### 步骤 3c：一键对比 + 自动选型（主线 C1 / 兜底 C2）
 
-### 步骤 3c：C1 vs C2 对比验证（结论）
+`finetune_csv/compare_fusion_strategies.py`（仓库已提供可运行版本，含 `--smoke` 自测：`python finetune_csv/compare_fusion_strategies.py --smoke`）在**同一份融合数据**上同时跑 C1、C2（加权）、C2（stacking），严格遵循工程最佳实践：
 
-`finetune_csv/compare_fusion_strategies.py`（仓库已提供可运行版本，含 `--smoke` 自测：`python finetune_csv/compare_fusion_strategies.py --smoke`）在**同一份融合数据**上同时跑 C1、C2（加权）、C2（stacking），在 train 训基模型、val 调组合器、test 评估，输出 RMSE / IC / RankIC / 方向命中率并自动给出最优方案（下游模型优先 LightGBM，未安装则回退 numpy Ridge）。
+- **train 训基模型 → val 调组合器并选型 → test 仅最终评估**：选型只看**验证集 IC**，杜绝「在测试集上挑方案」的选择泄漏。
+- **以 C1 为主线**：默认产出 C1 特征融合；仅当某个 C2 方案的**验证集 IC ≥ C1 + `--switch-threshold`**（默认 0.005）时，才作为**兜底**切换上位，避免噪声波动导致频繁换线。
+- 输出 val 与 test 两张指标表（RMSE / IC / RankIC / 方向命中率）、最终生产策略及切换理由；下游模型优先 LightGBM，未安装则回退 numpy Ridge。
+- 可用 `--out-json` 将选型结果与指标落盘，供生产流水线读取。
 
 真实使用：
 
@@ -239,7 +232,9 @@ python finetune_csv/compare_fusion_strategies.py \
     --train data/fusion_train.csv --val data/fusion_val.csv --test data/fusion_test.csv \
     --kronos-cols k_pred_ret,k_up_prob,k_pred_vol \
     --factor-cols pe,pb,roe,north_hold,news_sent,news_count,event_flag \
-    --label label_fwd_ret_5d
+    --label label_fwd_ret_5d \
+    --switch-threshold 0.005 \
+    --out-json data/fusion_selection.json
 ```
 
 **结论（理论 + 合成数据实证一致）**：
@@ -250,7 +245,62 @@ python finetune_csv/compare_fusion_strategies.py \
 | 样本少 / 因子异频稀疏（尤其消息面）/ 要求线上极稳可快速降级 | **C2 信号集成**（自由度小、最稳健，stacking 优于纯加权） |
 | 工程最佳实践 | **以 C1 为主线**，C2（尤其 stacking）作为对照与兜底集成 |
 
-> 在含交互项的合成数据上实测：C1 的 test IC 最高（C1 > C2-stacking > C2-加权），印证「有交互信号时 C1 上限更高」。**最终以你真实数据上该脚本的 val/test 指标为准**——把 `fusion_*.csv` 传入即可得到针对你数据的结论。
+> 选型在**验证集**上完成，C1 为默认主线，C2 仅在 val 上显著超阈值时兜底上位；测试集只用于汇报最终指标。**最终以你真实数据上该脚本的 val/test 指标为准**——把 `fusion_*.csv` 传入即可得到针对你数据的结论。
+
+### 步骤 4：生产编排与部署（`run_fusion.py`，C1 主线服务入口）
+
+前面 1~3 步是离线分析；真正**上线服务**用 `finetune_csv/run_fusion.py`，它把「Kronos 特征 → 因子对齐 → C1 下游模型训练 → 打包 → 服务预测」串成一条可部署主线（含 `smoke` 自测：`python finetune_csv/run_fusion.py smoke`）。
+
+**① 训练并打包模型 bundle：**
+
+```bash
+python finetune_csv/run_fusion.py train \
+    --price-csv finetune_csv/data/A_000001_daily.csv \
+    --factors data/factors_000001.csv \
+    --tokenizer pretrained/Kronos-Tokenizer-base \
+    --predictor pretrained/Kronos-base \
+    --out-bundle runs/fusion_000001 \
+    --symbol 000001 --lookback 90 --pred 5 --samples 30 --horizon 5 \
+    --train-end 2024-01-01 --val-end 2025-01-01
+```
+
+产出的 **bundle 目录**即可部署，内容：
+
+| 文件 | 说明 |
+| --- | --- |
+| `manifest.json` | 元信息：后端、特征列顺序、`lookback/pred/samples/horizon`、tokenizer/主模型路径、val/test 指标 |
+| `c1_lgb.txt` 或 `c1_ridge.npz` | 下游 C1 模型权重（LightGBM 原生格式 / numpy Ridge 参数） |
+
+**② 上线预测最新一天的未来走势：**
+
+```bash
+python finetune_csv/run_fusion.py predict \
+    --bundle runs/fusion_000001 \
+    --price-csv finetune_csv/data/A_000001_daily.csv \
+    --factors data/factors_000001.csv \
+    --out-json runs/fusion_000001/latest_prediction.json
+```
+
+输出示例（对未来 `horizon` 日收益的方向与幅度）：
+
+```json
+{
+  "as_of_date": "2025-06-20", "symbol": "000001", "horizon_days": 5,
+  "pred_fwd_ret": 0.0123, "direction": "up",
+  "k_up_prob": 0.62, "k_pred_vol": 0.018, "backend": "ridge"
+}
+```
+
+> 服务时只需历史价量（≥ `lookback` 根）+ 当日可得因子；脚本自动外推未来时间戳（频率无关），对最新窗口多次采样 → C1 打分 → 给出走势预测。
+
+### 部署形态与环境
+
+- **环境要求**：Python 3.10+ + PyTorch（CPU 即可，本机实测 `torch 2.12.1+cpu`）即可推理；`lightgbm` 可选——未安装时 C1 自动回退 numpy Ridge（无任何功能缺失，已实测）。仓库脚本用 **LightGBM 原生 `lgb.train` API（无需 scikit-learn）**；步骤 3a 内联示例里的 `LGBMRegressor` 是 sklearn 封装，才需额外装 scikit-learn。GPU 仅加速 Kronos 推理（多采样耗时大头），非必需。
+- **离线批量打分（推荐起步）**：用 crontab / 任务计划在收盘后跑一次 `run_fusion.py predict`，把 `latest_prediction.json` 落库或推到下游选股 / 回测。
+- **常驻服务**：把 `load_bundle` + `predict_latest` 包一层 Flask/FastAPI 接口（本仓 `webui/` 已有 Flask 范式可参考）；**进程启动时加载一次 tokenizer/主模型/bundle**，请求时只跑推理，避免每次重载权重。
+- **多标的**：对每只股票各训一个 bundle（`--symbol` 区分目录），或扩展为批量循环；大批量预测可改用 `KronosPredictor.predict_batch` 提速。
+- **更新节奏**：价量每日增量即可重打 Kronos 特征；C1 下游模型建议按月 / 季滚动重训（`train` 重跑覆盖 bundle），并用步骤 3c 的对照脚本定期复核 C1 是否仍优于 C2 兜底。
+- **防泄漏铁律**：线上预测当日只能用「收盘前可得」的因子；标签与选型口径必须与训练一致（见 4.2）。
 
 ---
 
@@ -274,6 +324,7 @@ for split in ["train","val","test"]:
 - [ ] 标签 `label_fwd_ret_5d` 用的是**样本日之后**的价格（`shift(-5)`），特征只用样本日及之前信息。
 - [ ] 训练 / 验证 / 测试**按时间不重叠**切分。
 - [ ] 季度因子前向填充，不得使用「披露日之后才知道」的数值回填到披露前。
+- [ ] **方案选型（C1 vs C2 / alpha / stacking 元模型）只在验证集上确定，测试集仅用于最终评估**——禁止按 test 指标挑方案（选择泄漏）。
 
 ### 4.3 评估指标
 
@@ -296,5 +347,6 @@ for split in ["train","val","test"]:
 
 ### 关联文档
 - 总览：[A股微调操作指南.md](A%E8%82%A1%E5%BE%AE%E8%B0%83%E6%93%8D%E4%BD%9C%E6%8C%87%E5%8D%97.md)
+- **逐步操作手册（runbook）：[方案C操作指南_数据到训练验证测试.md](%E6%96%B9%E6%A1%88C%E6%93%8D%E4%BD%9C%E6%8C%87%E5%8D%97_%E6%95%B0%E6%8D%AE%E5%88%B0%E8%AE%AD%E7%BB%83%E9%AA%8C%E8%AF%81%E6%B5%8B%E8%AF%95.md)** —— 照着敲的命令级操作指南
 - 方案 A（扩展 d_in，进 tokenizer）：[方案A_扩展Tokenizer输入维度.md](%E6%96%B9%E6%A1%88A_%E6%89%A9%E5%B1%95Tokenizer%E8%BE%93%E5%85%A5%E7%BB%B4%E5%BA%A6.md)
 - 方案 B（条件旁路，不动 tokenizer）：[方案B_因子条件旁路.md](%E6%96%B9%E6%A1%88B_%E5%9B%A0%E5%AD%90%E6%9D%A1%E4%BB%B6%E6%97%81%E8%B7%AF.md)

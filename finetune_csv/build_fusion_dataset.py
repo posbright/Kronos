@@ -79,9 +79,12 @@ def build_fusion(kf: pd.DataFrame, ff: pd.DataFrame, px: pd.DataFrame,
     df = df.merge(px[label_keys + [label_col]], on=label_keys, how="left")
 
     # 缺失处理：慢变因子前向填充，新闻类填 0（仅对存在的列操作）
+    #    有 symbol 列时按标的分组 ffill（防跨标的串值）；否则整体 ffill。
+    has_symbol = "symbol" in df.columns
     for col in _FFILL_FACTORS:
         if col in df.columns:
-            df[col] = df.groupby("symbol")[col].ffill()
+            df[col] = (df.groupby("symbol")[col].ffill() if has_symbol
+                       else df[col].ffill())
     for col in _ZERO_FACTORS:
         if col in df.columns:
             df[col] = df[col].fillna(0.0)

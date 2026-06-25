@@ -1,0 +1,89 @@
+# =============================================================================
+# Kronos 小范围验证实验配置（20 只股票）
+# 统一配置：构建数据 / 训练 / 验证 / 测试 四个阶段共用本文件。
+# 详细字段说明见 finetune_csv/pipeline/config.py 顶部注释。
+# =============================================================================
+
+# -------- 数据来源（Quantia 缓存优先，远程 DB 兜底/补因子）--------
+data_source:
+  quantia_root: "C:/xapproject/Quantia/Quantia"
+  cache_hist_root: ""        # 留空 = quantia_root/quantia/cache/hist
+  start_date: "2017-01-01"   # 拉取价量的最早日期
+  end_date: ""               # 留空 = 今天
+  db_sleep: 0.1              # 每次 DB 查询后 sleep 秒（远程库低并发保护）
+  db_retries: 3
+  use_db_features: true      # 是否用 DB 补充基本面(fin_*)（技术指标见 tech_source）
+  tech_source: "local"       # local=本地 OHLCV 现算技术指标(历史完整,推荐) | db=远程库
+
+# -------- 股票池：小范围验证默认 20 只 --------
+universe:
+  symbols: []                # 显式列表（如 ["000001","600519"]）；为空则自动从缓存按字典序挑选
+  max_symbols: 20
+  min_history: 250           # 至少 250 个交易日，过滤新股 / 数据过短
+
+# -------- 滚动日期切分：以「今天-1」为锚点向过去回推 --------
+# 取值建议：日频小范围验证，test/val 各 20~60 天；train_days=0 取剩余全部。
+splits:
+  anchor: ""                 # 留空 = 今天-1，再夹到可得最新交易日
+  test_days: 40
+  val_days: 40
+  train_days: 0              # 0 = 锚点之前剩余全部
+  label_horizon: 5           # 前看 5 日收益作为标签（与下游融合一致）
+
+# -------- 因子缺失处理（详见 pipeline/factors.py）--------
+factors:
+  add_mask: true             # 缺失率高的因子追加 <col>_isna 掩码列
+  mask_threshold: 0.05       # 缺失率 > 5% 才追加掩码列
+  strategy: {}               # 显式覆盖，如 {fin_roe: ffill, news_count: zero}
+
+# -------- 数据集 / 模型窗口参数 --------
+# lookback：历史回看长度。日频建议 90~250；须满足 lookback+predict <= max_context(512)。
+# predict ：预测步数。日频建议 5~20，越长越不稳。
+data:
+  out_root: ""               # 留空 = <repo>/DataSet
+  lookback_window: 90
+  predict_window: 10
+  max_context: 512
+  clip: 5.0                  # z-score 后裁剪到 ±clip，抑制极端值
+
+# -------- 训练超参（训练阶段使用）--------
+training:
+  tokenizer_epochs: 10
+  basemodel_epochs: 10
+  batch_size: 16
+  log_interval: 20
+  num_workers: 0             # Windows 上建议 0，避免多进程 DataLoader 问题
+  seed: 42
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.00001
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+  accumulation_steps: 1
+  patience: 8                # 早停耐心：连续 N 个 epoch 验证无提升即停
+
+# -------- 预训练 / 输出模型路径 --------
+model_paths:
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"  # HF 名或本地目录
+  pretrained_predictor: "NeoQuasar/Kronos-small"
+  exp_name: "kronos_smoke20"
+  base_path: ""              # 留空 = runs 目录自动管理
+  base_save_path: ""
+  finetuned_tokenizer: ""
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+# -------- 设备 --------
+device:
+  use_cuda: true
+  device_id: 0
+
+# -------- 输出 / 版本管理 --------
+runs:
+  runs_root: ""              # 留空 = <repo>/finetune_csv/runs
+  version: ""                # 留空 = 运行时间戳；不同版本独立留存便于对比
+
+experiment:
+  name: "kronos_smoke20"
+  description: "20 只股票小范围验证：滚动日期切分 + 因子缺失处理 + 过程日志"
+  use_comet: false

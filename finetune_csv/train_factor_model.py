@@ -81,8 +81,11 @@ class FactorKlineDataset(Dataset):
 
         cols = _PRICE_COLS + _TIME_COLS + self.factor_cols
         data = df[cols].copy()
+        # 缺失值处理：先按时间前向填充（仅用过去信息，避免 bfill 引入未来泄漏），
+        # 序列开头仍为空的用 0 兜底（z-score 后等价于“中性”取值）；最后断言无残留缺失。
         if data.isnull().any().any():
-            data = data.ffill().bfill()
+            data = data.ffill().fillna(0.0)
+        assert not data.isnull().any().any(), "填充后仍存在缺失值，请检查因子列"
 
         n = len(data)
         train_end = int(n * train_ratio)

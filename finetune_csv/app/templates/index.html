@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kronos 因子调参 / 重训 / 版本对比</title>
+  <style>
+    :root { --bg:#0f1419; --panel:#1a2230; --line:#2a3645; --fg:#e6edf3; --mut:#8b98a9;
+            --acc:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444;
+            --long:#22c55e; --short:#ef4444; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: "Microsoft YaHei", system-ui, sans-serif;
+           background:var(--bg); color:var(--fg); }
+    header { padding:12px 20px; border-bottom:1px solid var(--line);
+             display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+    header h1 { font-size:18px; margin:0; }
+    header .exp { color:var(--mut); font-size:13px; }
+    .kpis { display:flex; gap:10px; margin-left:auto; flex-wrap:wrap; }
+    .kpi { background:#0f1722; border:1px solid var(--line); border-radius:8px;
+           padding:5px 10px; min-width:88px; }
+    .kpi .k { font-size:11px; color:var(--mut); }
+    .kpi .v { font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
+    .wrap { display:grid; grid-template-columns: 430px 1fr; gap:16px; padding:16px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+             padding:14px; }
+    .panel h2 { font-size:14px; margin:0 0 10px; color:var(--mut); font-weight:600;
+                text-transform:uppercase; letter-spacing:.5px; }
+    .cat { border:1px solid var(--line); border-radius:8px; margin-bottom:8px; overflow:hidden; }
+    .cat-head { display:flex; align-items:center; gap:8px; padding:7px 10px;
+                background:#16202e; cursor:pointer; }
+    .cat-head .nm { font-weight:600; font-size:13px; }
+    .cat-head .badge { font-size:11px; color:var(--mut); }
+    .cat-head .red { color:var(--warn); font-size:11px; }
+    .cat-head select { margin-left:auto; background:#0f1722; color:var(--fg);
+                       border:1px solid var(--line); border-radius:6px; font-size:12px; padding:3px 6px; }
+    .cat-body { padding:4px 10px 8px; }
+    .factor-row { display:grid; grid-template-columns: 1fr 64px; align-items:center;
+                  gap:6px; padding:5px 0; border-bottom:1px dashed var(--line); }
+    .factor-row:last-child { border-bottom:0; }
+    .factor-row label { font-size:12.5px; cursor:pointer; display:flex; align-items:center; gap:6px; }
+    .factor-row .meta { display:flex; align-items:center; gap:6px; grid-column:1/3; }
+    .factor-row input[type=range] { width:100%; }
+    .factor-row .val { font-variant-numeric: tabular-nums; text-align:right; color:var(--acc); font-size:12px; }
+    .dir { font-size:10.5px; padding:1px 6px; border-radius:9px; white-space:nowrap; }
+    .dir.long { background:#14331f; color:#86efac; }
+    .dir.short { background:#3a1414; color:#fca5a5; }
+    .dir.flat { background:#27313f; color:var(--mut); }
+    .scoremini { height:5px; flex:1; background:#0f1722; border-radius:3px; overflow:hidden; min-width:40px; }
+    .scoremini > span { display:block; height:100%; background:linear-gradient(90deg,#3b82f6,#22c55e); }
+    .ctrl { display:flex; gap:8px; align-items:center; margin:10px 0; flex-wrap:wrap; }
+    button { background:var(--acc); color:#fff; border:0; border-radius:7px;
+             padding:8px 14px; font-size:13px; cursor:pointer; }
+    button.sec { background:#33425a; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    input[type=number] { width:64px; background:#0f1722; border:1px solid var(--line);
+             color:var(--fg); border-radius:6px; padding:6px; }
+    .search, select.search { width:100%; background:#0f1722; border:1px solid var(--line); color:var(--fg);
+              border-radius:6px; padding:7px; margin-bottom:8px; }
+    .scroll { max-height:440px; overflow:auto; }
+    table { width:100%; border-collapse:collapse; font-size:12.5px; }
+    th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+    th { color:var(--mut); font-weight:600; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; }
+    .pill.running { background:#1e3a5f; color:#7cc0ff; }
+    .pill.completed { background:#14331f; color:#86efac; }
+    .pill.failed { background:#3a1414; color:#fca5a5; }
+    .pill.queued { background:#33301a; color:#fcd34d; }
+    .bar { height:8px; background:#0f1722; border-radius:5px; overflow:hidden; }
+    .bar > span { display:block; height:100%; background:var(--acc); width:0; transition:width .3s; }
+    .imp-row { display:grid; grid-template-columns: 140px 1fr 46px; align-items:center;
+               gap:8px; margin:3px 0; font-size:12px; }
+    .imp-bar { height:12px; background:#0f1722; border-radius:4px; overflow:hidden; }
+    .imp-bar > span { display:block; height:100%; background:linear-gradient(90deg,#3b82f6,#22c55e); }
+    .muted { color:var(--mut); font-size:12px; }
+    .cmp-grid { display:grid; gap:14px; grid-template-columns: repeat(auto-fit,minmax(300px,1fr)); }
+    .cmp-card { background:#0f1722; border:1px solid var(--line); border-radius:8px; padding:12px; }
+    .cmp-card h3 { margin:0 0 8px; font-size:13px; }
+    img.viz { width:100%; border-radius:6px; border:1px solid var(--line); margin-top:8px; }
+    /* 多空影响图 */
+    .ls-row { display:grid; grid-template-columns: 140px 1fr; align-items:center; gap:8px;
+              margin:2px 0; font-size:12px; }
+    .ls-track { position:relative; height:14px; background:#0f1722; border-radius:4px; }
+    .ls-track .mid { position:absolute; left:50%; top:0; bottom:0; width:1px; background:#3a4655; }
+    .ls-track .fill { position:absolute; top:0; bottom:0; border-radius:3px; }
+    .ls-cat-title { font-size:12px; color:var(--mut); margin:8px 0 2px; font-weight:600; }
+    a { color:var(--acc); }
+    details > summary { cursor:pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Kronos 因子调参工作台</h1>
+    <span class="exp" id="expName"></span>
+    <span class="exp" id="dataInfo"></span>
+    <div class="kpis" id="kpis"></div>
+  </header>
+
+  <div class="wrap">
+    <!-- 左：因子权重调节（按类别分组）+ 重训 -->
+    <div class="panel">
+      <h2>因子权重 / 多空 / 评分（按类别分组）</h2>
+      <input class="search" id="factorSearch" placeholder="搜索因子…（中文名 / tech_macd / fin_roe）" />
+      <div class="ctrl">
+        <button class="sec" onclick="setAll(1)">全部置 1</button>
+        <button class="sec" onclick="setAll(0)">全部关闭</button>
+        <button class="sec" onclick="refreshAnalysis()">刷新分析</button>
+        <span class="muted" id="selCount"></span>
+      </div>
+      <div class="scroll" id="factorGroups"></div>
+      <div class="ctrl" style="margin-top:12px;">
+        <label class="muted">训练轮数</label>
+        <input type="number" id="epochs" min="1" value="" />
+        <label class="muted">底座版本</label>
+        <select id="baseVersion" class="search" style="width:auto;margin:0;">
+          <option value="">预训练（默认）</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <button id="retrainBtn" onclick="submitRetrain()">提交重训（后台完整训练）</button>
+      </div>
+      <div id="jobHint" class="muted"></div>
+    </div>
+
+    <!-- 右：综合画像 + 多空影响 + 任务 + 版本 + 对比 -->
+    <div style="display:flex; flex-direction:column; gap:16px;">
+      <div class="panel">
+        <h2>多空影响（按类别 · 绿多红空，长度=强度评分）</h2>
+        <div class="muted" id="lsHint" style="margin-bottom:6px"></div>
+        <div class="scroll" id="lsChart" style="max-height:320px"><span class="muted">加载中…</span></div>
+      </div>
+
+      <div class="panel">
+        <h2>后台任务</h2>
+        <div class="scroll" id="jobList" style="max-height:200px"><span class="muted">暂无任务</span></div>
+      </div>
+
+      <div class="panel">
+        <h2>已训练版本（勾选 2+ 个对比）</h2>
+        <div class="ctrl">
+          <button class="sec" onclick="loadVersions()">刷新</button>
+          <button onclick="compareSelected()">对比所选</button>
+        </div>
+        <div class="scroll" style="max-height:200px"><table id="verTable">
+          <thead><tr><th></th><th>版本</th><th>状态</th><th>最优loss</th>
+            <th>因子数</th><th>收敛</th><th>耗时(s)</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+
+      <div class="panel">
+        <h2>版本对比</h2>
+        <div class="cmp-grid" id="compareArea"><span class="muted">勾选版本后点「对比所选」</span></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const $ = (s)=>document.querySelector(s);
+let FACTORS = [];          // 列名顺序
+let META = {};             // col -> meta
+let GROUPS = {};           // category -> [col]
+let CATS = {};             // category -> {name_cn, side}
+let ANALYSIS = {};         // 最近一次分析结果
+let CATMODE = {};          // category -> 'independent' | 'mean'
+
+async function jget(u){ const r=await fetch(u); return r.json(); }
+async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}); return r.json(); }
+
+async function init(){
+  const f = await jget('/api/factors');
+  FACTORS = f.factor_cols || [];
+  GROUPS = f.groups || {};
+  CATS = f.categories || {};
+  (f.factor_meta||[]).forEach(m=>META[m.col]=m);
+  Object.keys(GROUPS).forEach(c=>CATMODE[c]='independent');
+  $('#expName').textContent = '实验: ' + (f.exp_name||'');
+  $('#dataInfo').textContent = `lookback=${f.lookback} predict=${f.predict} · 默认轮数=${f.default_epochs}`;
+  $('#epochs').value = f.default_epochs || 1;
+  renderFactors('');
+  await loadVersions();
+  await refreshAnalysis();
+  pollJobs();
+}
+
+// 类别中文名（含技术/基本面归属标记）
+function catName(c){
+  const side = CATS[c] ? (CATS[c].side==='technical'?'·技':CATS[c].side==='fundamental'?'·基':'') : '';
+  return (CATS[c]?CATS[c].name_cn:c) + side;
+}
+
+function dirBadge(d){
+  if(d>0) return '<span class="dir long">多 ↑</span>';
+  if(d<0) return '<span class="dir short">空 ↓</span>';
+  return '<span class="dir flat">中性</span>';
+}
+
+function renderFactors(filter){
+  const box = $('#factorGroups'); box.innerHTML='';
+  const f = (filter||'').toLowerCase();
+  // 类别按所属面 + 名称排序，技术面在前
+  const cats = Object.keys(GROUPS).sort((a,b)=>{
+    const sa=(CATS[a]&&CATS[a].side)||'z', sb=(CATS[b]&&CATS[b].side)||'z';
+    return sa===sb ? a.localeCompare(b) : (sa<sb?-1:1);
+  });
+  cats.forEach(cat=>{
+    const cols = GROUPS[cat].filter(c=>{
+      const m=META[c]||{};
+      return c.toLowerCase().includes(f) || (m.name_cn||'').toLowerCase().includes(f);
+    });
+    if(!cols.length) return;
+    const ci = ANALYSIS.categories ? ANALYSIS.categories[cat] : null;
+    const red = ci && ci.redundancy ? ci.redundancy.length : 0;
+    const wrap=document.createElement('div'); wrap.className='cat';
+    const catDir = ci ? dirBadge(ci.direction) : '';
+    const mode = CATMODE[cat]||'independent';
+    wrap.innerHTML = `
+      <div class="cat-head" onclick="toggleCat(this)">
+        <span class="nm">${catName(cat)}</span>
+        <span class="badge">${cols.length} 项</span>
+        ${catDir}
+        ${ci?`<span class="badge">综合IC ${(ci.agg_ic).toFixed(3)}</span>`:''}
+        ${red?`<span class="red" title="同类高相关对数（建议合并/取均值）">⚠冗余 ${red}</span>`:''}
+        <select onclick="event.stopPropagation()" onchange="CATMODE['${cat}']=this.value">
+          <option value="independent" ${mode==='independent'?'selected':''}>独立参与</option>
+          <option value="mean" ${mode==='mean'?'selected':''}>同类取均值</option>
+        </select>
+      </div>
+      <div class="cat-body">${cols.map(col=>factorRow(col)).join('')}</div>`;
+    box.appendChild(wrap);
+  });
+  bindRows();
+  updateCount();
+}
+
+function factorRow(col){
+  const m = META[col]||{}; const a = (ANALYSIS.factors||{})[col];
+  const score = a? a.score : 0; const dir = a? a.direction : 0;
+  const ic = a? a.ic : null; const conf = a? a.confidence : null;
+  const tip = `${m.name_cn||col}（${col}）\n${m.desc_cn||''}` + (ic!=null?`\nIC=${ic}  方向=${dir>0?'多':dir<0?'空':'中'}  置信=${conf}`:'');
+  return `
+   <div class="factor-row" data-col="${col}">
+     <label title="${tip.replace(/"/g,'&quot;')}">
+       <input type="checkbox" data-col="${col}" class="fchk" checked> ${m.name_cn||col}</label>
+     <span class="val" id="v_${col}">1.0</span>
+     <div class="meta">
+       ${dirBadge(dir)}
+       <div class="scoremini" title="强度评分 ${score}"><span style="width:${score}%"></span></div>
+       <input type="range" min="0" max="2" step="0.1" value="1" data-col="${col}" class="frng">
+     </div>
+   </div>`;
+}
+
+function bindRows(){
+  document.querySelectorAll('.frng').forEach(r=>{
+    r.oninput = ()=>{ $('#v_'+r.dataset.col).textContent=(+r.value).toFixed(1); };
+  });
+  document.querySelectorAll('.fchk').forEach(c=> c.onchange = updateCount);
+}
+function toggleCat(h){ const b=h.nextElementSibling; b.style.display = b.style.display==='none'?'':'none'; }
+$('#factorSearch').addEventListener('input', e=>renderFactors(e.target.value));
+
+function setAll(v){
+  document.querySelectorAll('.frng').forEach(r=>{ r.value=v; $('#v_'+r.dataset.col).textContent=(+v).toFixed(1); });
+  document.querySelectorAll('.fchk').forEach(c=>{ c.checked = v>0; });
+  updateCount();
+}
+function updateCount(){
+  const n=document.querySelectorAll('.fchk:checked').length;
+  $('#selCount').textContent = `已选 ${n} 个因子`;
+}
+
+// 收集当前 UI 状态 -> 因子通道规格（支持同类均值聚合）
+function collectSpecs(){
+  const specs=[]; const cols=[]; const weights={};
+  Object.keys(GROUPS).forEach(cat=>{
+    const checked=[];
+    GROUPS[cat].forEach(col=>{
+      const chk=document.querySelector(`.fchk[data-col="${col}"]`);
+      if(chk && chk.checked){
+        const rng=document.querySelector(`.frng[data-col="${col}"]`);
+        checked.push({col, w: parseFloat(rng.value)});
+      }
+    });
+    if(!checked.length) return;
+    const mode = CATMODE[cat]||'independent';
+    if(mode==='mean' && checked.length>1){
+      const signs = checked.map(o=>{ const a=(ANALYSIS.factors||{})[o.col]; return (a&&a.direction)? a.direction : (((META[o.col]||{}).bias)||1); });
+      const w = checked.reduce((s,o)=>s+o.w,0)/checked.length;
+      const name = `${(CATS[cat]?CATS[cat].name_cn:cat)}·均值`;
+      specs.push({name, mode:'mean', cols:checked.map(o=>o.col), signs, weight:+w.toFixed(3)});
+      cols.push(name); weights[name]=+w.toFixed(3);
+    } else {
+      checked.forEach(o=>{ specs.push({name:o.col, mode:'raw', cols:[o.col], signs:[1], weight:o.w});
+        cols.push(o.col); weights[o.col]=o.w; });
+    }
+  });
+  return {specs, cols, weights};
+}
+
+// 仅取勾选的原始列（用于分析，区别于聚合的训练规格）
+function collectRaw(){
+  const cols=[]; const weights={};
+  document.querySelectorAll('.fchk:checked').forEach(c=>{
+    const col=c.dataset.col; const rng=document.querySelector(`.frng[data-col="${col}"]`);
+    cols.push(col); weights[col]=parseFloat(rng.value);
+  });
+  return {cols, weights};
+}
+
+async function refreshAnalysis(){
+  $('#lsHint').textContent='分析中…';
+  const {cols, weights} = collectRaw();
+  const res = await jpost('/api/analysis', {factor_cols: cols.length?cols:FACTORS, factor_weights: weights});
+  if(res.error){ $('#lsHint').textContent='分析失败: '+res.error; return; }
+  ANALYSIS = res;
+  renderKpis(); renderLongShort();
+  renderFactors($('#factorSearch').value||'');
+}
+
+function renderKpis(){
+  const c=ANALYSIS.composite||{};
+  const kpi=(k,v,cls)=>`<div class="kpi"><div class="k">${k}</div><div class="v" style="color:${cls||'var(--fg)'}">${v}</div></div>`;
+  const dirTxt = c.direction>0?'偏多 ↑':c.direction<0?'偏空 ↓':'中性';
+  const dirCol = c.direction>0?'var(--long)':c.direction<0?'var(--short)':'var(--mut)';
+  $('#kpis').innerHTML =
+    kpi('综合方向', dirTxt, dirCol) +
+    kpi('综合评分', (c.score??0).toFixed(0), 'var(--acc)') +
+    kpi('置信度', ((c.confidence??0)*100).toFixed(0)+'%') +
+    kpi('信号分歧', ((c.divergence??0)*100).toFixed(0)+'%', (c.divergence>0.5?'var(--warn)':'var(--ok)')) +
+    kpi('预期收益(5日)', (c.expected_return_pct??0).toFixed(2)+'%', (c.expected_return_pct>=0?'var(--long)':'var(--short)')) +
+    kpi('日波动', (ANALYSIS.daily_volatility_pct??0).toFixed(2)+'%');
+}
+
+function renderLongShort(){
+  const fa = ANALYSIS.factors||{};
+  $('#lsHint').textContent = `目标=${ANALYSIS.target} · 样本=${ANALYSIS.n_rows} · 绿=越高越涨(多) 红=越高越跌(空)，条长=强度评分`;
+  const box=$('#lsChart'); box.innerHTML='';
+  const cats = Object.keys(GROUPS).sort();
+  cats.forEach(cat=>{
+    const cols=(GROUPS[cat]||[]).filter(c=>fa[c]);
+    if(!cols.length) return;
+    cols.sort((a,b)=>(fa[b].score||0)-(fa[a].score||0));
+    const title=document.createElement('div'); title.className='ls-cat-title';
+    const ci=(ANALYSIS.categories||{})[cat];
+    title.innerHTML=`${catName(cat)} ${ci?`· 综合 ${dirBadge(ci.direction)} IC ${ci.agg_ic.toFixed(3)}`:''}`;
+    box.appendChild(title);
+    cols.forEach(col=>{
+      const a=fa[col]; const half=Math.min(50, (a.score||0)/2);
+      const isLong=a.direction>0; const color=a.direction>0?'var(--long)':a.direction<0?'var(--short)':'var(--mut)';
+      const left=isLong?'50%':(50-half)+'%';
+      const row=document.createElement('div'); row.className='ls-row';
+      row.innerHTML=`<span title="${col}">${(META[col]||{}).name_cn||col}</span>
+        <div class="ls-track"><div class="mid"></div>
+          <div class="fill" style="left:${left};width:${half}%;background:${color}" title="IC=${a.ic} 评分=${a.score} 置信=${a.confidence}"></div></div>`;
+      box.appendChild(row);
+    });
+  });
+}
+
+async function submitRetrain(){
+  const {specs, cols} = collectSpecs();
+  if(cols.length===0){ $('#jobHint').textContent='请至少勾选一个因子'; return; }
+  const epochs=parseInt($('#epochs').value)||null;
+  const base=$('#baseVersion').value||null;
+  $('#retrainBtn').disabled=true;
+  const job=await jpost('/api/retrain',{factor_cols:cols, factor_specs:specs, epochs, base_version:base});
+  $('#retrainBtn').disabled=false;
+  $('#jobHint').innerHTML = job.error ? `<span style="color:var(--err)">${job.error}</span>`
+    : `已提交任务 <b>${job.version}</b>（${cols.length} 通道），后台训练中…`;
+  pollJobs();
+}
+
+async function pollJobs(){
+  const jobs=await jget('/api/jobs');
+  const box=$('#jobList');
+  if(!jobs.length){ box.innerHTML='<span class="muted">暂无任务</span>'; }
+  else {
+    box.innerHTML = jobs.map(j=>{
+      const p=j.progress||{}; const tot=p.total||j.epochs||1; const ep=p.epoch||0;
+      const pct=Math.round(100*ep/tot);
+      const tl=(p.train_loss!=null)?p.train_loss:'-'; const vl=(p.val_loss!=null)?p.val_loss:'-';
+      return `<div style="padding:7px 0;border-bottom:1px solid var(--line)">
+        <div style="display:flex;justify-content:space-between">
+          <span><b>${j.version}</b> <span class="pill ${j.status}">${j.status}</span></span>
+          <span class="muted">${(j.factor_cols||[]).length} 通道</span></div>
+        <div class="bar" style="margin:5px 0"><span style="width:${pct}%"></span></div>
+        <div class="muted">epoch ${ep}/${tot} · train=${tl} · val=${vl}
+          ${j.error?`<span style="color:var(--err)"> · ${String(j.error).split('\\n')[0]}</span>`:''}</div>
+      </div>`;
+    }).join('');
+  }
+  const anyActive = jobs.some(j=>j.status==='running'||j.status==='queued');
+  if(anyActive){ setTimeout(pollJobs, 1500); }
+  else { loadVersions(); }
+}
+
+async function loadVersions(){
+  const vers=await jget('/api/versions');
+  const tb=$('#verTable tbody'); tb.innerHTML='';
+  const sel=$('#baseVersion'); const cur=sel.value;
+  sel.innerHTML='<option value="">预训练（默认）</option>';
+  vers.forEach(v=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td><input type="checkbox" class="vchk" value="${v.version}"></td>
+      <td>${v.version}</td><td><span class="pill ${v.status||''}">${v.status||'-'}</span></td>
+      <td>${fmt(v.best_value)}</td><td>${(v.factor_cols||[]).length}</td>
+      <td>${v.converged?'是':'否'}</td><td>${v.total_seconds??'-'}</td>`;
+    tb.appendChild(tr);
+    const o=document.createElement('option'); o.value=v.version; o.textContent=v.version; sel.appendChild(o);
+  });
+  sel.value=cur;
+}
+function fmt(x){ return (x==null)?'-':(+x).toFixed(4); }
+
+async function compareSelected(){
+  const vs=[...document.querySelectorAll('.vchk:checked')].map(c=>c.value);
+  const area=$('#compareArea');
+  if(vs.length===0){ area.innerHTML='<span class="muted">请先勾选版本</span>'; return; }
+  const data=await jget('/api/compare?versions='+vs.join(','));
+  area.innerHTML = data.map(v=>{
+    const imp=v.factor_importance||{};
+    const rows=Object.entries(imp).map(([k,d])=>{
+      const pct=Math.round(100*(d.share||0));
+      const nm=(META[k]||{}).name_cn||k;
+      return `<div class="imp-row"><span title="${k}">${nm}</span>
+        <div class="imp-bar"><span style="width:${pct}%"></span></div>
+        <span>${pct}%</span></div>`;
+    }).join('') || '<span class="muted">无因子重要性</span>';
+    const wt=v.factor_weights||{};
+    const wtxt=Object.entries(wt).map(([k,w])=>`${(META[k]||{}).name_cn||k}=${w}`).join(', ');
+    const vm=v.validate_metrics, tm=v.test_metrics;
+    const hasViz=(v.viz_files||[]).includes('factor_weights.png');
+    const hasKline=(v.viz_files||[]).includes('kline_comparison.png');
+    return `<div class="cmp-card">
+      <h3>${v.version} <span class="pill ${v.status||''}">${v.status||''}</span></h3>
+      <div class="muted">最优loss ${fmt(v.best_value)} · 收敛 ${v.converged?'是':'否'} · ${(v.factor_cols||[]).length} 通道</div>
+      <div class="muted" style="margin:6px 0">用户权重: ${wtxt||'-'}</div>
+      ${vm?`<div class="muted">验证 recon=${fmt(vm.tokenizer_recon_mse)} pred=${fmt(vm.predictor_loss)}</div>`:''}
+      ${tm?`<div class="muted">测试 recon=${fmt(tm.tokenizer_recon_mse)} pred=${fmt(tm.predictor_loss)}</div>`:''}
+      <div style="margin-top:8px"><b style="font-size:12px;color:var(--mut)">学到的因子重要性（模型贡献）</b>${rows}</div>
+      ${hasKline?`<details open><summary class="muted">Kronos 原始 vs 因子调整 预测对比</summary><img class="viz" src="/viz/${v.version}/kline_comparison.png?t=${Date.now()}"></details>`:''}
+      ${hasViz?`<img class="viz" src="/viz/${v.version}/factor_weights.png?t=${Date.now()}">`:''}
+    </div>`;
+  }).join('');
+}
+
+init();
+</script>
+</body>
+</html>

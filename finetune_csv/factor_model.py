@@ -38,6 +38,13 @@ class KronosWithFactor(Kronos):
     """在原始 Kronos 上新增一路加性因子条件嵌入。"""
 
     def init_factor(self, factor_dim: int) -> None:
+        """挂上一路零初始化的因子嵌入 ``factor_emb = nn.Linear(factor_dim, d_model)``。
+
+        Args:
+            factor_dim: 因子向量维度 k（须为正整数，且与数据集/推理时一致）。
+        """
+        if not isinstance(factor_dim, int) or factor_dim <= 0:
+            raise ValueError(f"factor_dim 必须为正整数，收到 {factor_dim!r}")
         # 单独初始化，避免影响 from_pretrained 的权重加载（先 from_pretrained 再调用本方法）
         self.factor_dim = factor_dim
         self.factor_emb = nn.Linear(factor_dim, self.d_model)
@@ -45,12 +52,23 @@ class KronosWithFactor(Kronos):
         nn.init.zeros_(self.factor_emb.weight)
         nn.init.zeros_(self.factor_emb.bias)
 
+    def _check_factor(self, factor) -> None:
+        """校验传入因子张量的形状与已初始化的 factor_emb 是否匹配。"""
+        if not hasattr(self, "factor_emb"):
+            raise RuntimeError("使用 factor 前请先调用 init_factor(factor_dim)")
+        if factor.dim() != 3:
+            raise ValueError(f"factor 期望 3 维 [B, T, k]，收到 {tuple(factor.shape)}")
+        if factor.size(-1) != self.factor_dim:
+            raise ValueError(
+                f"factor 末维 {factor.size(-1)} 与 init_factor 的 factor_dim={self.factor_dim} 不一致")
+
     def forward(self, s1_ids, s2_ids, stamp=None, factor=None,
                 padding_mask=None, use_teacher_forcing=False, s1_targets=None):
         x = self.embedding([s1_ids, s2_ids])
         if stamp is not None:
             x = x + self.time_emb(stamp)
         if factor is not None:                       # 新增：因子条件旁路
+            self._check_factor(factor)
             x = x + self.factor_emb(factor)
         x = self.token_drop(x)
 
@@ -71,11 +89,63 @@ class KronosWithFactor(Kronos):
         s2_logits = self.head.cond_forward(x2)
         return s1_logits, s2_logits
 
+    def decode_s1(self, s1_ids, s2_ids, stamp=None, factor=None, padding_mask=None):
+        """与基类 decode_s1 一致，但额外注入因子条件旁路（供 FactorPredictor 自回归推理用）。
+
+        factor 为 None 时行为与基类完全一致（零初始化时也等价于原始 Kronos）。
+        """
+        x = self.embedding([s1_ids, s2_ids])
+        if stamp is not None:
+            x = x + self.time_emb(stamp)
+        if factor is not None:
+            self._check_factor(factor)
+            x = x + self.factor_emb(factor)
+        x = self.token_drop(x)
+
+        for layer in self.transformer:
+            x = layer(x, key_padding_mask=padding_mask)
+        x = self.norm(x)
+
+        s1_logits = self.head(x)
+        return s1_logits, x
+
 
 def load_with_factor(pretrained_predictor: str, factor_dim: int) -> "KronosWithFactor":
     """加载预训练主模型权重，并挂上零初始化的因子嵌入。"""
     model = KronosWithFactor.from_pretrained(pretrained_predictor)
     model.init_factor(factor_dim)
+    return model
+
+
+def load_factor_model(model_dir: str, factor_dim: int) -> "KronosWithFactor":
+    """重新加载已训练好的 KronosWithFactor（含 factor_emb 学到的权重）。
+
+    关键坑：from_pretrained 依据 __init__ 配置重建模型，此时 factor_emb 尚不存在，
+    因此 factor_emb.weight/bias 不会被加载；若随后直接 init_factor 又会把它清零，
+    导致「学到的因子权重丢失」。本函数在 init_factor 之后，再从检查点把 factor_emb
+    的权重补回（strict=False 仅匹配存在的键）。
+
+    Args:
+        model_dir:  best_model 目录（含 model.safetensors 或 pytorch_model.bin）。
+        factor_dim: 因子维度（须与训练时一致）。
+    """
+    model = KronosWithFactor.from_pretrained(model_dir)
+    model.init_factor(factor_dim)
+
+    st_path = os.path.join(model_dir, "model.safetensors")
+    bin_path = os.path.join(model_dir, "pytorch_model.bin")
+    if os.path.exists(st_path):
+        from safetensors.torch import load_file
+        state = load_file(st_path)
+    elif os.path.exists(bin_path):
+        state = torch.load(bin_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(f"{model_dir} 缺少 model.safetensors / pytorch_model.bin")
+
+    factor_state = {k: v for k, v in state.items() if k.startswith("factor_emb.")}
+    if not factor_state:
+        raise KeyError(f"{model_dir} 检查点缺少 factor_emb.*，可能不是因子模型。")
+    model.load_state_dict(factor_state, strict=False)
     return model
 
 

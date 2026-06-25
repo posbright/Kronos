@@ -236,13 +236,19 @@ def create_dataloaders(config):
     return train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler
 
 
-def train_model(model, tokenizer, device, config, save_dir, logger):
+def train_model(model, tokenizer, device, config, save_dir, logger,
+                external_loaders=None, epoch_callback=None):
     logger.info("Starting training...")
     use_ddp = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if use_ddp else 0
     world_size = dist.get_world_size() if use_ddp else 1
     
-    train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
+    if external_loaders is not None:
+        # 由外部（run_train.py）注入预切分 train/val DataLoader，跳过比例内部切分。
+        train_loader, val_loader, train_dataset, val_dataset = external_loaders
+        train_sampler = val_sampler = None
+    else:
+        train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.predictor_learning_rate,
@@ -360,6 +366,13 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
                 save_msg = f"Best model saved to: {model_save_path} (validation loss: {best_val_loss:.4f})"
                 logger.info(save_msg)
                 print(save_msg)
+
+        # 外部收敛回调（run_train.py 用 TrainingLogger 记录 metrics.csv 并判定早停）。
+        if epoch_callback is not None:
+            should_stop = epoch_callback(epoch + 1, avg_train_loss, avg_val_loss)
+            if should_stop:
+                logger.info(f"Early stop triggered at epoch {epoch + 1} (no improvement).")
+                break
     
     return best_val_loss
 

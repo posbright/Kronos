@@ -1,11 +1,12 @@
 """方案 C 对比验证：在同一份融合数据上量化比较 C1（特征融合）与 C2（信号集成）。
 
-中文说明：
+中文说明（遵循方案 C 工程最佳实践：以 C1 为主线，C2 作为对照与兜底）：
     - C1 特征融合：把 Kronos 衍生特征 ⊕ 因子特征喂给一个下游模型，直接预测标签。
     - C2 信号集成：Kronos 特征单独出一路预测、因子特征单独出一路预测，再用
       (a) 加权（在验证集上搜索 alpha）或 (b) stacking（验证集上训一个线性元模型）融合。
-    脚本在 train 上训基模型、在 val 上调组合器、在 test 上评估，输出 RMSE / IC / RankIC /
-    方向命中率，并给出「谁更好」的结论。
+    流程：train 训基模型 → val 调组合器并『选型』→ test 仅做最终评估。
+    选型只看『验证集』指标（杜绝在测试集上选模型造成的选择泄漏）；并以 C1 为生产主线，
+    仅当某个 C2 方案在『验证集 IC』上比 C1 高出 switch_threshold 时，才作为兜底切换上位。
 
     下游模型优先用 LightGBM（若已安装），否则回退到 numpy 实现的 Ridge 回归——因此本脚本
     在没有 lightgbm / sklearn 的环境也能完整跑通（冒烟自测即用回退实现）。
@@ -16,13 +17,14 @@
         --train data/fusion_train.csv --val data/fusion_val.csv --test data/fusion_test.csv \
         --kronos-cols k_pred_ret,k_up_prob,k_pred_vol \
         --factor-cols pe,pb,roe,north_hold,news_sent,news_count,event_flag \
-        --label label_fwd_ret_5d
+        --label label_fwd_ret_5d --switch-threshold 0.005 --out-json data/fusion_selection.json
 
     # 冒烟自测（无需任何文件 / 第三方库，用合成数据验证对比流程跑通）
     python compare_fusion_strategies.py --smoke
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -66,13 +68,15 @@ def _ridge_fit_predict(x_tr, y_tr, x_eval_list, alpha=1.0):
 
 
 def _fit_predict(x_tr, y_tr, x_eval_list):
-    """训练下游模型并对多个评估集预测。LightGBM 优先，否则 Ridge 回退。"""
+    """训练下游模型并对多个评估集预测。LightGBM（原生 API）优先，否则 Ridge 回退。"""
     if _HAS_LGB:
-        model = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05,
-                                  num_leaves=31, subsample=0.8,
-                                  colsample_bytree=0.8, verbosity=-1)
-        model.fit(x_tr, y_tr)
-        return [model.predict(x) for x in x_eval_list]
+        dtrain = lgb.Dataset(np.asarray(x_tr, dtype=np.float64),
+                             label=np.asarray(y_tr, dtype=np.float64))
+        params = {"objective": "regression", "learning_rate": 0.05,
+                  "num_leaves": 31, "feature_fraction": 0.8,
+                  "bagging_fraction": 0.8, "bagging_freq": 1, "verbosity": -1}
+        booster = lgb.train(params, dtrain, num_boost_round=300)
+        return [booster.predict(np.asarray(x, dtype=np.float64)) for x in x_eval_list]
     return _ridge_fit_predict(x_tr, y_tr, x_eval_list, alpha=1.0)
 
 
@@ -124,7 +128,8 @@ def run_c1(tr, va, te, feat_cols, label):
 def run_c2(tr, va, te, kronos_cols, factor_cols, label):
     """C2 信号集成：两路独立基模型 + (加权/stacking) 组合器。
 
-    返回 (加权法 test 预测, stacking 法 test 预测, 最优 alpha)。
+    返回 ((加权 val 预测, 加权 test 预测), (stacking val 预测, stacking test 预测), 最优 alpha)。
+    所有组合器参数（alpha / 元模型）只在验证集上确定，禁止触碰 test。
     """
     # 两路基模型分别在各自特征上训练，产出 val/test 预测
     pk_va, pk_te = _fit_predict(tr[kronos_cols].values, tr[label].values,
@@ -140,43 +145,100 @@ def run_c2(tr, va, te, kronos_cols, factor_cols, label):
         ic = _ic(y_va, sig_va)
         if ic > best_ic:
             best_ic, best_alpha = ic, alpha
+    weighted_va = best_alpha * _zscore(pk_va) + (1 - best_alpha) * _zscore(pf_va)
     weighted_te = best_alpha * _zscore(pk_te) + (1 - best_alpha) * _zscore(pf_te)
 
     # (b) stacking：在验证集上用线性元模型组合两路预测
     meta_x_va = np.column_stack([pk_va, pf_va])
     meta_x_te = np.column_stack([pk_te, pf_te])
-    (stack_te,) = _ridge_fit_predict(meta_x_va, y_va, [meta_x_te], alpha=1.0)
+    stack_va, stack_te = _ridge_fit_predict(meta_x_va, y_va,
+                                            [meta_x_va, meta_x_te], alpha=1.0)
 
-    return weighted_te, stack_te, float(best_alpha)
+    return (weighted_va, weighted_te), (stack_va, stack_te), float(best_alpha)
 
 
-# ----------------------------- 主流程 -----------------------------
+# ----------------------------- 选型与主流程 -----------------------------
 
-def compare(tr, va, te, kronos_cols, factor_cols, label, verbose=True):
-    """在同一数据上跑 C1 与 C2，返回各方案 test 指标与结论。"""
+# 生产主线策略名（方案 C 工程最佳实践：以 C1 特征融合为主线）
+_MAIN_STRATEGY = "C1_特征融合"
+
+
+def select_production(val_metrics, switch_threshold):
+    """按『验证集 IC』选生产策略：C1 为主线，挑战者需超阈值才兜底切换。
+
+    Args:
+        val_metrics: {策略名: {"IC": ...}}，必须含主线 ``_MAIN_STRATEGY``。
+        switch_threshold: 挑战者相对 C1 的验证集 IC 增益阈值（如 0.005）。
+    Returns:
+        被选为生产策略的名称（默认回到 C1，体现「以 C1 为主线」）。
+    """
+    c1_ic = val_metrics[_MAIN_STRATEGY]["IC"]
+    challengers = {k: m["IC"] for k, m in val_metrics.items() if k != _MAIN_STRATEGY}
+    if not challengers:
+        return _MAIN_STRATEGY
+    best = max(challengers, key=challengers.get)
+    return best if challengers[best] >= c1_ic + switch_threshold else _MAIN_STRATEGY
+
+
+def _print_block(title, metrics):
+    """打印一组方案的指标表。"""
+    print(f"\n[{title}]")
+    print(f"{'方案':<22}{'RMSE':>10}{'IC':>10}{'RankIC':>10}{'Hit':>8}")
+    for name, m in metrics.items():
+        print(f"{name:<22}{m['RMSE']:>10.4f}{m['IC']:>10.4f}"
+              f"{m['RankIC']:>10.4f}{m['Hit']:>8.3f}")
+
+
+def compare(tr, va, te, kronos_cols, factor_cols, label,
+            switch_threshold=0.005, verbose=True):
+    """在同一数据上跑 C1 与 C2，按『验证集』选型，返回选型结果与 val/test 指标。
+
+    工程最佳实践（方案 C）：
+      - 以 C1 特征融合为主线（默认生产策略）。
+      - C2（加权 / stacking）作为对照与兜底；仅当其『验证集 IC』≥ C1 + switch_threshold
+        时才切换上位，避免噪声波动导致频繁换线。
+      - 选型只看验证集，test 仅做最终评估，杜绝选择泄漏。
+    """
     feat_cols = list(kronos_cols) + list(factor_cols)
-    y_te = te[label].values
+    y_va, y_te = va[label].values, te[label].values
 
-    _, c1_te = run_c1(tr, va, te, feat_cols, label)
-    w_te, s_te, alpha = run_c2(tr, va, te, kronos_cols, factor_cols, label)
+    c1_va, c1_te = run_c1(tr, va, te, feat_cols, label)
+    (w_va, w_te), (s_va, s_te), alpha = run_c2(
+        tr, va, te, kronos_cols, factor_cols, label)
 
-    results = {
-        "C1_特征融合": _metrics(y_te, c1_te),
-        "C2_加权(alpha=%.2f)" % alpha: _metrics(y_te, w_te),
-        "C2_stacking": _metrics(y_te, s_te),
+    preds = {
+        _MAIN_STRATEGY: (c1_va, c1_te),
+        "C2_加权(alpha=%.2f)" % alpha: (w_va, w_te),
+        "C2_stacking": (s_va, s_te),
     }
-    # 以 test IC 作为主排序指标（越大越好），RMSE 作次要参考
-    winner = max(results, key=lambda k: results[k]["IC"])
+    val_metrics = {k: _metrics(y_va, p[0]) for k, p in preds.items()}
+    test_metrics = {k: _metrics(y_te, p[1]) for k, p in preds.items()}
+
+    # 以验证集 IC 选生产策略：C1 主线 + 兜底切换
+    production = select_production(val_metrics, switch_threshold)
 
     if verbose:
         backend = "LightGBM" if _HAS_LGB else "Ridge(numpy 回退)"
-        print(f"下游模型后端: {backend}")
-        print(f"{'方案':<22}{'RMSE':>10}{'IC':>10}{'RankIC':>10}{'Hit':>8}")
-        for name, m in results.items():
-            print(f"{name:<22}{m['RMSE']:>10.4f}{m['IC']:>10.4f}"
-                  f"{m['RankIC']:>10.4f}{m['Hit']:>8.3f}")
-        print(f"==> 按 test IC 最优: {winner}")
-    return results, winner
+        print(f"下游模型后端: {backend}    选型阈值(val IC 增益): +{switch_threshold:.3f}")
+        _print_block("验证集 (val) —— 仅用于选型", val_metrics)
+        _print_block("测试集 (test) —— 仅最终评估", test_metrics)
+        c1_ic = val_metrics[_MAIN_STRATEGY]["IC"]
+        prod_ic = val_metrics[production]["IC"]
+        if production == _MAIN_STRATEGY:
+            print(f"\n==> 生产策略: {production}（主线；无 C2 方案在 val 上超过 "
+                  f"C1 IC {c1_ic:.4f} + {switch_threshold:.3f}）")
+        else:
+            print(f"\n==> 生产策略: {production}（兜底切换；val IC {prod_ic:.4f} "
+                  f"≥ C1 {c1_ic:.4f} + {switch_threshold:.3f}）")
+        print(f"    生产策略测试集指标: {test_metrics[production]}")
+
+    return {
+        "production": production,
+        "alpha": alpha,
+        "switch_threshold": switch_threshold,
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+    }
 
 
 def _synth_fusion(n=900, seed=0):
@@ -219,15 +281,27 @@ def _smoke_test():
     tr, va, te = _synth_fusion(n=900)
     kronos_cols = ["k_pred_ret", "k_up_prob", "k_pred_vol"]
     factor_cols = ["pe", "pb", "roe", "news_sent", "news_count", "event_flag"]
-    results, winner = compare(tr, va, te, kronos_cols, factor_cols,
-                              "label_fwd_ret_5d", verbose=True)
+    out = compare(tr, va, te, kronos_cols, factor_cols,
+                  "label_fwd_ret_5d", switch_threshold=0.005, verbose=True)
 
-    # 校验：三方案指标均为有限值，IC 合法区间
-    for name, m in results.items():
-        assert np.isfinite(m["RMSE"]) and np.isfinite(m["IC"]), f"{name} 指标非有限"
-        assert -1.0 <= m["IC"] <= 1.0, f"{name} IC 越界"
-    assert winner in results
-    print(f"[smoke] compare_fusion_strategies 通过：三方案均产出有效指标，最优={winner}")
+    # 校验：val/test 指标均为有限值，IC 合法区间
+    for split in ("val_metrics", "test_metrics"):
+        for name, m in out[split].items():
+            assert np.isfinite(m["RMSE"]) and np.isfinite(m["IC"]), f"{name} 指标非有限"
+            assert -1.0 <= m["IC"] <= 1.0, f"{name} IC 越界"
+    assert out["production"] in out["val_metrics"]
+    assert _MAIN_STRATEGY in out["val_metrics"], "缺少主线 C1"
+
+    # 显式校验「主线 + 阈值切换」逻辑：挑战者需超阈值才能上位
+    vm = {_MAIN_STRATEGY: {"IC": 0.100},
+          "C2_加权(alpha=0.50)": {"IC": 0.102},
+          "C2_stacking": {"IC": 0.104}}
+    assert select_production(vm, 0.005) == _MAIN_STRATEGY, "未达阈值不应切换（应留在 C1）"
+    vm2 = dict(vm, **{"C2_stacking": {"IC": 0.110}})
+    assert select_production(vm2, 0.005) == "C2_stacking", "超过阈值应兜底切换到挑战者"
+
+    print(f"[smoke] compare_fusion_strategies 通过：选型在验证集完成（无 test 泄漏），"
+          f"主线=C1，生产策略={out['production']}")
 
 
 def main():
@@ -237,6 +311,9 @@ def main():
     parser.add_argument("--factor-cols",
                         default="pe,pb,roe,north_hold,news_sent,news_count,event_flag")
     parser.add_argument("--label", default="label_fwd_ret_5d")
+    parser.add_argument("--switch-threshold", type=float, default=0.005,
+                        help="C2 相对 C1 的验证集 IC 增益阈值，超过才切换上位（默认 0.005）")
+    parser.add_argument("--out-json", default=None, help="可选：将选型结果与指标落盘为 JSON")
     parser.add_argument("--smoke", action="store_true", help="运行无需文件的冒烟自测")
     args = parser.parse_args()
 
@@ -254,7 +331,14 @@ def main():
     factor_cols = [c.strip() for c in args.factor_cols.split(",") if c.strip()]
     # 仅保留实际存在的因子列，避免某些标的缺列报错
     factor_cols = [c for c in factor_cols if c in tr.columns]
-    compare(tr, va, te, kronos_cols, factor_cols, args.label, verbose=True)
+    out = compare(tr, va, te, kronos_cols, factor_cols, args.label,
+                  switch_threshold=args.switch_threshold, verbose=True)
+
+    if args.out_json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
+        with open(args.out_json, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        print(f"[compare] 选型结果已写入 {args.out_json}")
 
 
 if __name__ == "__main__":

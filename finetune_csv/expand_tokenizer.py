@@ -64,6 +64,13 @@ def expand_tokenizer(pretrained: str, save_dir: str, k_extra: int) -> str:
             copied += 1
 
     # 4) 部分继承 embed / head 的前 old_d_in 维，新增维度保持随机初始化
+    #    若不同 Kronos 版本改了输入层命名，提前报清晰错误而非 KeyError。
+    required = ["embed.weight", "embed.bias", "head.weight", "head.bias"]
+    missing = [k for k in required if k not in old_sd or k not in new_sd]
+    if missing:
+        raise KeyError(
+            f"tokenizer 缺少预期的输入层权重键 {missing}；当前 KronosTokenizer 结构可能已变更，"
+            f"请检查 embed/head 的命名后再移植。")
     #    embed.weight: [d_model, d_in] -> 复制前 old_d_in 列；embed.bias: [d_model] -> 直接复制
     new_sd["embed.weight"][:, :old_d_in] = old_sd["embed.weight"]
     new_sd["embed.bias"] = old_sd["embed.bias"].clone()

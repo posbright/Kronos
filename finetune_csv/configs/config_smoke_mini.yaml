@@ -1,0 +1,67 @@
+# =============================================================================
+# 迷你端到端连通性测试配置（仅用于验证 train/validate/test 脚本管线，不代表真实效果）
+# 使用已缓存的 Kronos-base 预训练权重，极小窗口 / 1 个 epoch，便于 CPU 快速跑通。
+# =============================================================================
+
+data_source:
+  quantia_root: "C:/xapproject/Quantia/Quantia"
+  tech_source: "local"
+  use_db_features: false
+
+universe:
+  symbols: []
+  max_symbols: 3
+  min_history: 30
+
+splits:
+  anchor: ""
+  test_days: 5
+  val_days: 5
+  train_days: 0
+  label_horizon: 1
+
+factors:
+  add_mask: true
+  mask_threshold: 0.05
+
+data:
+  out_root: "finetune_csv/_mini_test/DataSet"
+  lookback_window: 16
+  predict_window: 4
+  max_context: 512
+  clip: 5.0
+
+training:
+  tokenizer_epochs: 1
+  basemodel_epochs: 1
+  batch_size: 8
+  log_interval: 5
+  num_workers: 0
+  seed: 42
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.00001
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+  accumulation_steps: 1
+  patience: 3
+
+model_paths:
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  pretrained_predictor: "NeoQuasar/Kronos-base"   # 已缓存，避免下载
+  exp_name: "kronos_mini"
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+device:
+  use_cuda: false
+  device_id: 0
+
+runs:
+  runs_root: "finetune_csv/_mini_test/runs"
+  version: "minitest"
+
+experiment:
+  name: "kronos_mini"
+  description: "迷你端到端连通性测试"
+  use_comet: false

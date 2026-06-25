@@ -61,7 +61,8 @@ def build_features(predictor: KronosPredictor, px: pd.DataFrame, symbol: str,
     px = px.sort_values("timestamps").reset_index(drop=True)
 
     rows = []
-    for end in range(lookback, len(px) - pred_len):
+    # 含最后一个可用窗口：end 取到 len(px) - pred_len（range 上界需 +1）。
+    for end in range(lookback, len(px) - pred_len + 1):
         hist = px.iloc[end - lookback:end]
         x_df = hist[_PRICE_COLS].reset_index(drop=True)
         x_ts = hist["timestamps"].reset_index(drop=True)
@@ -124,7 +125,7 @@ def _smoke_test() -> None:
     px = _synth_price(n=80)
     feats = build_features(predictor, px, symbol="TEST",
                            lookback=60, pred_len=5, samples=3)
-    assert len(feats) == 80 - 60 - 5, f"窗口数异常: {len(feats)}"
+    assert len(feats) == 80 - 60 - 5 + 1, f"窗口数异常: {len(feats)}"
     assert list(feats.columns) == ["date", "symbol", "k_pred_ret", "k_up_prob", "k_pred_vol"]
     assert feats[["k_pred_ret", "k_up_prob", "k_pred_vol"]].notnull().all().all()
     assert ((feats["k_up_prob"] >= 0) & (feats["k_up_prob"] <= 1)).all()

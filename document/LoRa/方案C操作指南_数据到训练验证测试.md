@@ -126,6 +126,12 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 - 其他因子缺失用中位数兜底，再兜底 0。
 - 产出的 `price.csv/factors.csv` 默认无 NaN，可直接进入后续 C1 训练流程。
 
+价量清洗（`--sanitize-prices`，**默认开启**）：
+
+- 前复权（qfq）会让少数标的产生**散落的负价 / 负成交额**（实测约 25 只 / 3436 行，分布在序列中段而非早期）。
+- 默认会丢弃 `OHLC<=0` 或 `amount<0` 或 `volume<0` 的行，**逐标的**（在本地因子重算前，避免污染 `local_ma/ret`）+ 合并后再兜底一次。
+- 零成交量（停牌）合法，予以保留。如需保留原始负价用于排查，加 `--no-sanitize-prices` 关闭。
+
 ### 2.3 参数化设计（便于后续接入 Quantia 项目）
 
 常用参数：
@@ -134,14 +140,18 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 - 时间：`--start-date`、`--end-date`、`--anchor-date`、`--val-days`、`--test-days`
 - 规模：`--max-symbols`（0=全量）
 - 数据源开关：
-    - `--scan-db-symbols`
-    - `--disable-db-fallback-kline`
+    - `--scan-db-symbols`（额外并入 `cn_stock_spot` 的标的集）
+    - `--disable-db-fallback-kline`（禁用价量 DB 回退，仅用 cache）
     - `--disable-db-features`（一键禁用所有 DB 因子，仅 cache+本地重算）
-    - `--disable-local-recompute`
+    - `--disable-local-recompute`（禁用本地技术因子重算）
     - `--db-financial` / `--no-db-financial`（DB 财务因子 `fin_*`，**默认开启**，全历史有效）
     - `--db-tech` / `--no-db-tech`（DB 技术指标 `tech_*`，**默认关闭**，远程仅近月）
-- DB 节流与稳健性：`--db-sleep`、`--db-retries`
-- DB 覆盖与校验：`--prefer-remote-db`、`--db-host`、`--db-user`、`--db-password`、`--db-database`、`--db-port`、`--check-db`
+- 价量清洗：`--sanitize-prices` / `--no-sanitize-prices`（**默认开启**，丢弃负价 / 负额行，见 2.2）
+- DB 性能/节流：`--fin-chunk`（财务因子按 code 分块 `IN` 查询的批大小，**默认 400**；远程偶发 `Lost connection during query` 时调小更稳）、`--db-sleep`、`--db-retries`、`--progress-every`
+- DB 覆盖与校验：`--prefer-remote-db` / `--no-prefer-remote-db`、`--db-host`、`--db-user`、`--db-password`、`--db-database`、`--db-port`、`--db-charset`、`--check-db`、`--db-check-timeout`（默认 5 秒）
+- 自测：`--smoke`（合成数据跑通构建逻辑，不连 DB / cache）
+
+> **参数即布尔开关速记**：`action=BooleanOptionalAction` 的参数（`--db-financial`/`--db-tech`/`--sanitize-prices`/`--prefer-remote-db`）都支持 `--xxx` 开 / `--no-xxx` 关；`store_true` 的（`--scan-db-symbols`/`--disable-*`/`--check-db`/`--smoke`）只有出现即生效。
 
 > **因子覆盖说明**：远程 `cn_stock_indicators`（技术指标）/`cn_stock_spot` 仅覆盖近月，
 > 历史训练区间（2017→2025）的技术因子由本地重算 `local_*` 提供；
@@ -216,11 +226,15 @@ for s in ['train','validation','test']:\
 - `--lookback`：历史窗口（**≤ 512**，受 `max_context` 限制）。
 - `--pred`：预测步数（与后续标签 `horizon` 对齐，常用 5）。
 - `--samples`：每窗采样次数（越大越稳但越慢）。
-- `--skip-existing`（默认开）：复用已生成的 part，**断点续跑**。
+- `--skip-existing` / `--no-skip-existing`（默认开）：复用已生成的 part，**断点续跑**；想强制全量重算用 `--no-skip-existing`。
+- `--seed`：随机抽样种子（**仅固定选股**；采样路径仍随机，特征非逐位可复现）。
+- `--tokenizer` / `--predictor`：权重来源，默认 `NeoQuasar/Kronos-Tokenizer-base` / `NeoQuasar/Kronos-base`，可换成微调后的本地目录。
+- `--out` / `--report`：输出与报告路径，默认 `{data-root}/kronos_features.csv` 与 `{data-root}/kronos_features_report.json`。
+- `--max-context`（默认 512）：与 `--lookback` 共同受模型上限约束，**`lookback ≤ max-context ≤ 512`**。
 - **产物**：
     - `DataSet/dataC/kronos_features.csv`：`date,symbol,k_pred_ret,k_up_prob,k_pred_vol`
     - `DataSet/dataC/_kronos_parts/{symbol}.csv`：逐只增量产物（中断不丢失，可续跑）
-    - `DataSet/dataC/kronos_features_report.json`：参数 / 设备 / 选中标的 / 每只耗时 / 行数
+    - `DataSet/dataC/kronos_features_report.json`：参数 / 设备(`device_resolved`) / 选中标的 / 每只耗时 / 行数
 
 > 耗时公式：**标的数 × 窗口数 × samples × 单次耗时**。CPU 单次 ≈ 0.75s；`sample_count` 批量采样无加速优势。
 > 每只标的窗口数 ≈ `recent_days + 1`。例：10 只 × 120 天 × samples=10 @CPU ≈ 2.5h。
@@ -288,8 +302,8 @@ step2 的 `kronos_features.csv` 是**多标的**表，其日期窗口通常**横
     --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
     --horizon 5
 ```
-
-- `--sources`（默认 `validation,test`）：从哪些 split 读取因子/价格并纵向合并。
+- `--data-root`（默认 `DataSet/dataC`）：dataC 根目录；`--kronos`（默认 `{data-root}/kronos_features.csv`）；step2 产物路径。
+- `--out-dir`（默认 `{data-root}`）：`fusion_*.csv` 与 `fusion_report.json` 的输出目录。- `--sources`（默认 `validation,test`）：从哪些 split 读取因子/价格并纵向合并。
 - `--horizon`：未来收益标签天数 H（与 step2 的 `--pred` 对齐，常用 5）。
 - `--train-end` / `--val-end`：显式切分边界（不含）。**留空则按唯一交易日 70/15/15 自动分位切分**
   （比例可用 `--train-frac`/`--val-frac` 调）。**生产/全年数据建议显式指定边界**（见第 4.3 节）。
@@ -348,23 +362,27 @@ step2 的 `kronos_features.csv` 是**多标的**表，其日期窗口通常**横
 
 ## 5. 步骤 4：数据自检与防泄漏检查（关键）
 
-把下面保存为临时脚本或直接 `python -c` 跑，确认无 NaN、列齐全、时间不重叠：
+> step3 的编排脚本已内置了多项检查（NaN / 时间不重叠 / `k_up_prob` 越界）；本节是**独立复核**，可随时重跑。
+> 下面脚本不写死因子名，而是把除 `date/symbol/label` 之外的**所有列**视为特征检查，适配 dataC 的 `local_*/fin_*/k_*` 列。
 
 ```python
 import pandas as pd
-feat = ["k_pred_ret","k_up_prob","k_pred_vol","pe","pb","roe",
-        "north_hold","news_sent","news_count","event_flag"]
+root = "DataSet/dataC"          # build_dataC_step3_fusion.py 的输出目录（单文件版则为 data）
+label = "label_fwd_ret_5d"      # 与 --horizon 对齐
+meta = {"date", "symbol", label}
 prev_max = None
-for split in ["train","val","test"]:
-    df = pd.read_csv(f"data/fusion_{split}.csv", parse_dates=["date"])
-    have = [c for c in feat if c in df.columns]
-    assert {"date","label_fwd_ret_5d"}.issubset(df.columns), f"{split} 缺列"
-    assert not df[have].isnull().any().any(), f"{split} 特征有 NaN"
+for split in ["train", "val", "test"]:
+    df = pd.read_csv(f"{root}/fusion_{split}.csv", parse_dates=["date"], dtype={"symbol": str})
+    feat = [c for c in df.columns if c not in meta]   # 其余全部视为特征
+    assert {"date", label}.issubset(df.columns), f"{split} 缺列"
+    assert not df[feat].isnull().any().any(), f"{split} 特征有 NaN"
+    assert df[label].notnull().all(), f"{split} 标签有 NaN"
+    assert df["k_up_prob"].between(0, 1).all(), f"{split} k_up_prob 越界"
     lo, hi = df.date.min(), df.date.max()
     if prev_max is not None:
         assert lo > prev_max, f"{split} 与上一段时间重叠（泄漏）"
     prev_max = hi
-    print(split, len(df), "日期", lo.date(), "~", hi.date())
+    print(split, len(df), "特征列", len(feat), "日期", lo.date(), "~", hi.date())
 print("数据自检通过")
 ```
 
@@ -378,18 +396,23 @@ print("数据自检通过")
 
 ## 6. 步骤 5：C1 vs C2 选型（验证集选型，C1 主线 / C2 兜底）
 
+`compare_fusion_strategies.py` 直接消费 step3 产出的 `fusion_{train,val,test}.csv`（多标的兼容）：
+
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\compare_fusion_strategies.py `
-    --train data\fusion_train.csv --val data\fusion_val.csv --test data\fusion_test.csv `
+    --train DataSet\dataC\fusion_train.csv --val DataSet\dataC\fusion_val.csv --test DataSet\dataC\fusion_test.csv `
     --kronos-cols k_pred_ret,k_up_prob,k_pred_vol `
-    --factor-cols pe,pb,roe,north_hold,news_sent,news_count,event_flag `
+    --factor-cols amplitude,quote_change,ups_downs,turnover,local_ret_1d,local_ret_5d,local_ma_5,local_ma_10,local_ma_20,local_vol_ma_5,local_amt_ma_5,local_hl_spread,local_oc_change,fin_eps,fin_bps,fin_roe,fin_roa `
     --label label_fwd_ret_5d `
     --switch-threshold 0.005 `
-    --out-json data\fusion_selection.json
+    --out-json DataSet\dataC\fusion_selection.json
 ```
 
+- `--kronos-cols` / `--factor-cols`：参与融合的 Kronos 特征列 / 外部因子列（逗号分隔，必须是 `fusion_*.csv` 中真实存在的列名）。
+  上例仅列举部分 dataC 因子；可把 22 个 `fin_*` + 9 个 `local_*` + 4 个 cache 因子全部填入。
+- `--label`（默认 `label_fwd_ret_5d`）：与 step3 的 `--horizon` 对齐。
 - 同时跑 **C1 特征融合**、**C2 加权**、**C2 stacking**；在 train 训基模型、**val 调组合器并选型**、test 仅评估。
-- **以 C1 为主线**：默认选 C1；仅当某 C2 方案**验证集 IC ≥ C1 + 0.005** 时才**兜底切换**。
+- **以 C1 为主线**：默认选 C1；仅当某 C2 方案**验证集 IC ≥ C1 + `--switch-threshold`（默认 0.005）** 时才**兜底切换**。
 - 输出 val/test 两张指标表 + 生产策略 + 切换理由；`--out-json` 落盘供流水线读取。
 - 终端末尾会显示 `==> 生产策略: C1_特征融合（主线；...）` 或兜底切换说明。
 
@@ -398,6 +421,14 @@ print("数据自检通过")
 ---
 
 ## 7. 步骤 6：训练并打包可部署的 C1 模型 bundle
+
+> **重要区分（避免踩坑）**：`run_fusion.py train` 是**单标的、端到端**入口——它从一份 `--price-csv` + `--factors`
+> **自己重新生成 Kronos 特征**再训练打包，**不会**消费 step3 产出的多标的 `fusion_*.csv`。
+> 因此：
+> - **单标的快速打包/上线**：用下面 `run_fusion.py train`（自带特征生成 → 融合 → 训练 → bundle）。
+> - **多标的 dataC（本指南主线）**：step5 的 `compare_fusion_strategies.py` 已在 `fusion_*.csv` 上完成
+>   C1 训练 + val 选型 + test 评估，可直接据其 `--out-json` 结论上线；若要多标的**可部署 bundle**，
+>   需在 `fusion_*.csv` 上单独训练 C1（按 `manifest` 约定保存），暂未提供多标的 bundle 一键脚本。
 
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\run_fusion.py train `
@@ -481,6 +512,7 @@ print("数据自检通过")
 任何一步上真实数据前，先确认管线本身没问题（**无需权重 / 外部文件**）：
 
 ```powershell
+.\.venv\Scripts\python.exe finetune_csv\build_dataC_step1_from_quantia.py --smoke
 .\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py --smoke
 .\.venv\Scripts\python.exe finetune_csv\build_fusion_dataset.py --smoke
 .\.venv\Scripts\python.exe finetune_csv\compare_fusion_strategies.py --smoke
@@ -488,6 +520,8 @@ print("数据自检通过")
 ```
 
 全部出现「通过」字样即环境就绪。`run_fusion.py smoke` 会完整跑 train→save→load→predict 并打印一条示例预测。
+（注：`build_dataC_step2_kronos_features.py` / `build_dataC_step3_fusion.py` 为编排脚本，其核心逻辑分别由
+`build_kronos_features.py --smoke` 与 `build_fusion_dataset.py --smoke` 覆盖，无需重复 smoke。）
 
 ---
 

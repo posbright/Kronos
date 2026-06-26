@@ -4,6 +4,7 @@
 > 设计原理与字段含义见 [方案C_外部融合集成.md](方案C_外部融合集成.md)；本文只讲**怎么一步步做**。
 >
 > 适用环境：Windows + 仓库根目录 `.venv` 虚拟环境（CPU 即可）。命令中的 Python 一律用 `.\.venv\Scripts\python.exe`。
+> **Linux / GPU 服务器**：脚本与参数完全一致，只需替换 shell 写法（激活 venv / 解释器 / 路径）——详见**第 12 节 Windows → Linux 环境切换**。
 
 ---
 
@@ -50,6 +51,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 ```
 
 - **CPU 即可推理**（实测 `torch 2.x+cpu`）。GPU 仅加速 Kronos 多采样，非必需。
+- **Linux 用户**：把上面的 `.\.venv\Scripts\Activate.ps1` / `.\.venv\Scripts\python.exe` 换成 `source .venv/bin/activate` / `.venv/bin/python`，其余命令参数不变（完整对照见第 12 节）。
 - **预训练权重**：方案 C 把 Kronos 当纯预测器，需要一份 tokenizer + 主模型。可用官方 `NeoQuasar/Kronos-Tokenizer-base` + `NeoQuasar/Kronos-base`，或你微调后的本地权重目录（下文以 `pretrained/Kronos-Tokenizer-base`、`pretrained/Kronos-base` 占位）。
 
 ---
@@ -547,7 +549,7 @@ print("数据自检通过")
 
 > **本次 demo 实跑**（`--top 5`）：`as_of=2026-06-16`，10 只截面打分，预测方向与实际**普遍相反**
 > （预测 up 多数实际 down）——这是 831 行极小数据**过拟合 + 截面太窄**的必然结果，
-> **不是模型缺陷**，换全市场/全年数据并参考第 13 节优化后即改善。
+> **不是模型缺陷**，换全市场/全年数据并参考第 14 节优化后即改善。
 
 ### 9.2 单标的端到端预测（配合 `run_fusion.py train` 的 bundle）
 
@@ -560,7 +562,7 @@ print("数据自检通过")
 ```
 
 - 只需历史价量（**≥ lookback 根**）+ 当日可得因子；脚本自动**外推未来时间戳**（频率无关），对最新窗口多次采样 → C1 打分。
-- 若 bundle 未记录权重路径，可用 `--tokenizer`/`--predictor` 覆盖；`--device` 选推理设备（见第 12 节）。
+- 若 bundle 未记录权重路径，可用 `--tokenizer`/`--predictor` 覆盖；`--device` 选推理设备（见第 13 节）。
 - 输出（对未来 `horizon` 日收益的方向与幅度）：
 
 ```json
@@ -655,7 +657,123 @@ python finetune_csv/build_dataC_step2_kronos_features.py \
 
 ---
 
-## 12. GPU 训练 / CPU 推理：可行性与最佳实践
+## 12. Windows → Linux 环境切换（命令对照与详细步骤）
+
+> 本文正文命令默认 **Windows + PowerShell**。切到 **Linux（Ubuntu/CentOS 等，含 GPU 服务器）** 时，
+> **脚本与参数完全不变**，只需替换"激活 venv / Python 解释器 / 路径与换行符"等 shell 层面写法。
+> 本节给出一一对照与可直接照抄的 Linux 命令。
+
+### 12.1 Windows ↔ Linux 写法对照
+
+| 用途 | Windows（PowerShell） | Linux（bash） |
+| --- | --- | --- |
+| 激活虚拟环境 | `.\.venv\Scripts\Activate.ps1` | `source .venv/bin/activate` |
+| 直接调 venv 解释器 | `.\.venv\Scripts\python.exe` | `.venv/bin/python`（或激活后直接 `python`） |
+| 命令换行符 | 反引号 `` ` `` | 反斜杠 `\` |
+| 路径分隔符 | `\` 或 `/` 均可 | 一律 `/` |
+| 仓库根 | `C:\xapproject\Quantia\Kronos` | 例如 `/home/user/Kronos` |
+| Quantia 项目根 | `C:/xapproject/Quantia/Quantia` | 例如 `/home/user/Quantia` |
+| 环境变量引用 | `$env:VAR` | `$VAR` |
+| HF 缓存目录 | `%USERPROFILE%\.cache\huggingface` | `~/.cache/huggingface` |
+| 设执行策略 | `Set-ExecutionPolicy -Scope Process RemoteSigned` | 无需（bash 无此概念） |
+
+> **要点**：所有 `finetune_csv/*.py` 的**参数名、默认值、行为在两个平台完全一致**——
+> 文档里凡是 `.\.venv\Scripts\python.exe finetune_csv\xxx.py` 的命令，Linux 上写成
+> `.venv/bin/python finetune_csv/xxx.py` 即可，参数原样照搬。
+
+### 12.2 Linux 首次环境准备（逐条执行）
+
+```bash
+# 1) 取代码
+git clone https://github.com/posbright/Kronos.git
+cd Kronos
+
+# 2) 建虚拟环境（不要从 Windows 拷 .venv，二进制不兼容）
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3) 安装 PyTorch
+#    CPU 机：
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+#    GPU 机（按 CUDA 版本换 index-url，cu121 示例）：
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# 4) 其余依赖
+pip install -r requirements.txt
+
+# 5) 验证（CPU 机 cuda 显示 False 属正常）
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+```
+
+> **不要直接复制 Windows 的 `.venv`**：venv 内是平台相关的二进制（解释器软链、`*.pyd`/`*.so`、
+> `torch` whl），跨平台拷贝必坏。务必在 Linux 上重新 `python3 -m venv` 并重装依赖。
+
+### 12.3 数据 / 权重 / 路径迁移
+
+- **代码**：随 git 同步，无需额外处理。
+- **数据 `DataSet/dataC`**：已 gitignore，**不随 git 走**。两种方式（同第 11.3 节）：
+  - 重建：Linux 上重跑步骤 1（需能连 Quantia DB / cache）。
+  - 拷贝：`scp`/`rsync` 传到 Linux 相同相对路径，例如
+    ```bash
+    rsync -avz user@winhost:/c/xapproject/Quantia/Kronos/DataSet/dataC/ ./DataSet/dataC/
+    ```
+- **预训练权重**：首次 `from_pretrained` 自动下载到 `~/.cache/huggingface`；离线机把 Windows 的
+  `%USERPROFILE%\.cache\huggingface` 拷到 Linux `~/.cache/huggingface`，或用本地权重目录传 `--tokenizer/--predictor`。
+- **硬编码路径**：步骤 1 的 `--quantia-root`/`--cache-hist-root` 默认值是 Windows 路径，Linux 上**显式传 Linux 路径**：
+  ```bash
+  .venv/bin/python finetune_csv/build_dataC_step1_from_quantia.py \
+      --quantia-root /home/user/Quantia \
+      --cache-hist-root /home/user/Quantia/quantia/cache/hist \
+      --out-root /home/user/Kronos/DataSet/dataC \
+      --anchor-date 2026-06-24 --val-days 180 --test-days 180
+  ```
+- **Quantia `.env`**：脚本默认读 `{quantia-root}/.env` 的 `QUANTIA_DB_*`，确认该文件在 Linux 上存在且可读；
+  先 `--check-db` 验证连通（见 2.1）。
+
+### 12.4 Linux 上跑全流程（命令直接照抄）
+
+```bash
+source .venv/bin/activate
+
+# 步骤2：GPU 生成 Kronos 特征（CPU 机去掉 --device 或用 --device cpu）
+.venv/bin/python finetune_csv/build_dataC_step2_kronos_features.py \
+    --data-root ./DataSet/dataC --device cuda:0 \
+    --max-symbols 300 --recent-days 250 --samples 30 --skip-existing
+
+# 步骤3：融合 + 切分
+.venv/bin/python finetune_csv/build_dataC_step3_fusion.py \
+    --data-root ./DataSet/dataC --horizon 5
+
+# 步骤5：选型
+.venv/bin/python finetune_csv/compare_fusion_strategies.py \
+    --train DataSet/dataC/fusion_train.csv --val DataSet/dataC/fusion_val.csv \
+    --test DataSet/dataC/fusion_test.csv --label label_fwd_ret_5d \
+    --out-json DataSet/dataC/fusion_selection.json
+
+# 步骤6：训练多标的 C1 bundle
+.venv/bin/python finetune_csv/train_c1_bundle.py \
+    --data-root ./DataSet/dataC --out-bundle runs/dataC_c1 --horizon 5
+
+# 步骤8：上线截面打分
+.venv/bin/python finetune_csv/train_c1_bundle.py --predict \
+    --data-root ./DataSet/dataC --out-bundle runs/dataC_c1 \
+    --top 10 --out-json runs/dataC_c1/latest_ranking.json
+```
+
+### 12.5 Linux 常见坑
+
+- **换行符（CRLF→LF）**：从 Windows 带过来的 CSV/脚本可能是 CRLF；Python 读 CSV 不受影响，
+  但 shell 脚本（`.sh`）若为 CRLF 会报 `bad interpreter`，用 `dos2unix file.sh` 或 `sed -i 's/\r$//' file.sh` 修。
+- **shell 脚本可执行权限**：`chmod +x webui/start.sh` 后再 `./start.sh`。
+- **大小写敏感**：Linux 文件名/路径**区分大小写**（`DataSet` ≠ `dataset`），照抄仓库原名。
+- **`python` vs `python3`**：多数发行版裸 `python` 不存在，建系统层用 `python3`；激活 venv 后 `python` 即指向 venv。
+- **GPU 不可见**：`nvidia-smi` 正常但 `torch.cuda.is_available()` 为 False → 多半装了 CPU 版 torch，
+  按 12.2 第 3 步重装 CUDA 版（见第 13 节关于设备无关性的说明）。
+- **后台常驻**：长任务用 `nohup ... &`、`tmux`/`screen` 或 `systemd` 守护，避免断连中断（step2 自带断点续跑可续）。
+
+---
+
+## 13. GPU 训练 / CPU 推理：可行性与最佳实践
 
 > **结论先行：完全可行，且推荐"GPU 离线、CPU 上线"。** 训练阶段的 GPU 只加速 step2 的 Kronos 采样；
 > 下游 C1 模型与上线打分本就在 CPU 上跑。
@@ -684,13 +802,13 @@ python finetune_csv/build_dataC_step2_kronos_features.py \
 
 ---
 
-## 13. 效果不理想时的优化空间（提升预测准确性）
+## 14. 效果不理想时的优化空间（提升预测准确性）
 
 > demo（10 只 × 120 天）的负 IC **不代表方案本身无效**，而是**数据太小 + 截面太窄**导致严重过拟合。
 > 下面按"杠杆从大到小"排列优化方向。
 
 1. **扩大数据规模（最大杠杆）**：从 10 只 × 120 天扩到**全市场 × 多年**。
-   样本量上去后，41 维特征不再过拟合，截面 IC 才有统计意义（先做第 11~12 节的 GPU 迁移）。
+   样本量上去后，41 维特征不再过拟合，截面 IC 才有统计意义（先做第 11、13 节的 GPU 迁移）。
 2. **提升 Kronos 特征质量**：`--samples` 调大（生产 ≥30，越大方向概率越稳）、`--lookback` 调优（≤512）、
    用 `predict_batch` 在 GPU 上负担更大规模与更高采样。
 3. **因子工程（截面类任务最关键）**：
@@ -710,7 +828,7 @@ python finetune_csv/build_dataC_step2_kronos_features.py \
 
 ---
 
-## 14. 常见问题 / 排错
+## 15. 常见问题 / 排错
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |

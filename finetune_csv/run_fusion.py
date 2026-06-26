@@ -55,6 +55,11 @@ from build_kronos_features import build_features, _PRICE_COLS  # noqa: E402
 from build_fusion_dataset import (build_fusion, time_split,  # noqa: E402
                                   _FFILL_FACTORS, _ZERO_FACTORS)
 from compare_fusion_strategies import _metrics, _HAS_LGB  # noqa: E402
+from kronos_loader import (  # noqa: E402
+    DEFAULT_PREDICTOR_MS,
+    DEFAULT_TOKENIZER_MS,
+    load_kronos_predictor,
+)
 
 if _HAS_LGB:
     import lightgbm as lgb  # noqa: E402
@@ -291,22 +296,30 @@ def load_bundle(bundle_dir: str):
 
 # ----------------------------- CLI -----------------------------
 
-def _load_predictor(tokenizer_src, predictor_src, device):
-    from model import Kronos, KronosTokenizer, KronosPredictor
-    tok = KronosTokenizer.from_pretrained(tokenizer_src)
-    mdl = Kronos.from_pretrained(predictor_src)
-    return KronosPredictor(mdl, tok, device=device, max_context=512)
+def _load_predictor(tokenizer_src, predictor_src, device, model_source="modelscope"):
+    predictor, load_meta = load_kronos_predictor(
+        tokenizer_src=tokenizer_src,
+        predictor_src=predictor_src,
+        device=device,
+        max_context=512,
+        prefer_source=model_source,
+        verbose=True,
+    )
+    return predictor, load_meta
 
 
 def cmd_train(args):
-    predictor = _load_predictor(args.tokenizer, args.predictor, args.device)
+    predictor, load_meta = _load_predictor(args.tokenizer, args.predictor, args.device, args.model_source)
     px = pd.read_csv(args.price_csv)
     ff = pd.read_csv(args.factors)
     model, manifest, metrics, sizes = train_pipeline(
         predictor, px, ff, symbol=args.symbol, lookback=args.lookback,
         pred=args.pred, samples=args.samples, horizon=args.horizon,
         train_end=args.train_end, val_end=args.val_end, backend=args.backend,
-        tokenizer_src=args.tokenizer, predictor_src=args.predictor)
+        tokenizer_src=load_meta["tokenizer"]["source"],
+        predictor_src=load_meta["predictor"]["source"])
+    manifest["tokenizer_provider"] = load_meta["tokenizer"]["provider"]
+    manifest["predictor_provider"] = load_meta["predictor"]["provider"]
     save_bundle(args.out_bundle, model, manifest)
     print(f"[train] 后端={manifest['backend']}  切分 train/val/test={sizes}")
     for split, m in metrics.items():
@@ -316,11 +329,11 @@ def cmd_train(args):
 
 def cmd_predict(args):
     model, manifest = load_bundle(args.bundle)
-    tok_src = args.tokenizer or manifest.get("tokenizer_src")
-    mdl_src = args.predictor or manifest.get("predictor_src")
+    tok_src = args.tokenizer or manifest.get("tokenizer_src") or DEFAULT_TOKENIZER_MS
+    mdl_src = args.predictor or manifest.get("predictor_src") or DEFAULT_PREDICTOR_MS
     if not tok_src or not mdl_src:
         raise SystemExit("缺少 tokenizer/predictor 路径：bundle 未记录且未通过 --tokenizer/--predictor 提供")
-    predictor = _load_predictor(tok_src, mdl_src, args.device)
+    predictor, _ = _load_predictor(tok_src, mdl_src, args.device, args.model_source)
     px = pd.read_csv(args.price_csv)
     ff = pd.read_csv(args.factors) if args.factors else None
     out = predict_latest(predictor, model, manifest, px, ff)
@@ -377,8 +390,10 @@ def main():
     pt = sub.add_parser("train", help="训练并打包 C1 模型 bundle")
     pt.add_argument("--price-csv", required=True)
     pt.add_argument("--factors", required=True)
-    pt.add_argument("--tokenizer", required=True)
-    pt.add_argument("--predictor", required=True)
+    pt.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_MS,
+                    help="tokenizer 来源（默认 ModelScope ID，可传本地目录）")
+    pt.add_argument("--predictor", default=DEFAULT_PREDICTOR_MS,
+                    help="predictor 来源（默认 ModelScope ID，可传本地目录）")
     pt.add_argument("--out-bundle", required=True)
     pt.add_argument("--symbol", default="UNKNOWN")
     pt.add_argument("--lookback", type=int, default=90)
@@ -389,14 +404,20 @@ def main():
     pt.add_argument("--val-end", default="2025-01-01")
     pt.add_argument("--backend", choices=["auto", "lightgbm", "ridge"], default="auto")
     pt.add_argument("--device", default=None)
+    pt.add_argument("--model-source", choices=["modelscope", "hf"], default="modelscope",
+                    help="模型源优先级（默认 modelscope，失败自动回退 hf）")
 
     pp = sub.add_parser("predict", help="用 bundle 预测最新一天的未来走势")
     pp.add_argument("--bundle", required=True)
     pp.add_argument("--price-csv", required=True)
     pp.add_argument("--factors", default=None)
-    pp.add_argument("--tokenizer", default=None, help="覆盖 bundle 记录的 tokenizer 路径")
-    pp.add_argument("--predictor", default=None, help="覆盖 bundle 记录的主模型路径")
+    pp.add_argument("--tokenizer", default=None,
+                    help="覆盖 bundle 记录的 tokenizer 路径（若两处都无则默认 ModelScope）")
+    pp.add_argument("--predictor", default=None,
+                    help="覆盖 bundle 记录的主模型路径（若两处都无则默认 ModelScope）")
     pp.add_argument("--device", default=None)
+    pp.add_argument("--model-source", choices=["modelscope", "hf"], default="modelscope",
+                    help="模型源优先级（默认 modelscope，失败自动回退 hf）")
     pp.add_argument("--out-json", default=None)
 
     sub.add_parser("smoke", help="无需权重/文件的端到端冒烟自测")

@@ -7,7 +7,7 @@
 
 输入
 - DataSet/dataC/{validation,test}/price.csv（最近窗口足够覆盖 recent_days+lookback+pred）。
-- 缓存的 Kronos 权重（默认 NeoQuasar/Kronos-Tokenizer-base + NeoQuasar/Kronos-base）。
+- 缓存的 Kronos 权重（默认 ModelScope 优先：AI-ModelScope/*，HF 兜底：NeoQuasar/*）。
 
 输出
 - DataSet/dataC/kronos_features.csv：date,symbol,k_pred_ret,k_up_prob,k_pred_vol
@@ -58,7 +58,11 @@ for p in (str(_THIS_DIR), str(_REPO_ROOT)):
         sys.path.insert(0, p)
 
 from build_kronos_features import build_features  # noqa: E402
-from model import Kronos, KronosTokenizer, KronosPredictor  # noqa: E402
+from kronos_loader import (  # noqa: E402
+    DEFAULT_PREDICTOR_MS,
+    DEFAULT_TOKENIZER_MS,
+    load_kronos_predictor,
+)
 
 PRICE_COLS = ["open", "high", "low", "close", "volume", "amount"]
 
@@ -117,8 +121,12 @@ _PER_CALL_SEC = {"cpu": 0.75, "cuda": 0.05, "mps": 0.15}
 def main() -> None:
     ap = argparse.ArgumentParser(description="方案C 第2步：Kronos 衍生特征（CPU 子集版）")
     ap.add_argument("--data-root", default="C:/xapproject/Quantia/Kronos/DataSet/dataC")
-    ap.add_argument("--tokenizer", default="NeoQuasar/Kronos-Tokenizer-base")
-    ap.add_argument("--predictor", default="NeoQuasar/Kronos-base")
+    ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_MS,
+                    help="tokenizer 来源（默认 ModelScope ID；本地目录也可）")
+    ap.add_argument("--predictor", default=DEFAULT_PREDICTOR_MS,
+                    help="predictor 来源（默认 ModelScope ID；本地目录也可）")
+    ap.add_argument("--model-source", choices=["modelscope", "hf"], default="modelscope",
+                    help="模型源优先级（默认 modelscope，失败自动回退 hf）")
     ap.add_argument("--out", default="")
     ap.add_argument("--report", default="")
     ap.add_argument("--max-symbols", type=int, default=10)
@@ -151,11 +159,16 @@ def main() -> None:
     symbols = _pick_symbols(price, need=need, n=args.max_symbols, seed=args.seed)
     print(f"[step2] 选中 {len(symbols)} 只标的: {symbols}")
 
-    print(f"[step2] 加载 Kronos 权重 {args.predictor} ...")
+    print(f"[step2] 加载 Kronos 权重（优先 {args.model_source}）...")
     t0 = time.time()
-    tok = KronosTokenizer.from_pretrained(args.tokenizer)
-    mdl = Kronos.from_pretrained(args.predictor)
-    predictor = KronosPredictor(mdl, tok, device=device, max_context=args.max_context)
+    predictor, load_meta = load_kronos_predictor(
+        tokenizer_src=args.tokenizer,
+        predictor_src=args.predictor,
+        device=device,
+        max_context=args.max_context,
+        prefer_source=args.model_source,
+        verbose=True,
+    )
     print(f"[step2] 模型加载耗时 {time.time() - t0:.1f}s")
 
     per_call = _PER_CALL_SEC.get(device.split(":")[0], 0.75)
@@ -215,7 +228,9 @@ def main() -> None:
             "seed": args.seed,
             "device": args.device,
             "device_resolved": device,
+            "model_source": args.model_source,
         },
+        "loaded": load_meta,
         "symbols": symbols,
         "per_symbol": per_symbol,
         "total_rows": int(len(feats_all)),

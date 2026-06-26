@@ -52,7 +52,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 
 - **CPU 即可推理**（实测 `torch 2.x+cpu`）。GPU 仅加速 Kronos 多采样，非必需。
 - **Linux 用户**：把上面的 `.\.venv\Scripts\Activate.ps1` / `.\.venv\Scripts\python.exe` 换成 `source .venv/bin/activate` / `.venv/bin/python`，其余命令参数不变（完整对照见第 12 节）。
-- **预训练权重**：方案 C 把 Kronos 当纯预测器，需要一份 tokenizer + 主模型。可用官方 `NeoQuasar/Kronos-Tokenizer-base` + `NeoQuasar/Kronos-base`，或你微调后的本地权重目录（下文以 `pretrained/Kronos-Tokenizer-base`、`pretrained/Kronos-base` 占位）。
+- **预训练权重**：方案 C 把 Kronos 当纯预测器，需要一份 tokenizer + 主模型。默认走**魔塔优先、HF 兜底**：`AI-ModelScope/Kronos-Tokenizer-base` + `AI-ModelScope/Kronos-base`（失败自动回退 `NeoQuasar/...`）；也可传你微调后的本地权重目录。
 
 ---
 
@@ -230,7 +230,8 @@ for s in ['train','validation','test']:\
 - `--samples`：每窗采样次数（越大越稳但越慢）。
 - `--skip-existing` / `--no-skip-existing`（默认开）：复用已生成的 part，**断点续跑**；想强制全量重算用 `--no-skip-existing`。
 - `--seed`：随机抽样种子（**仅固定选股**；采样路径仍随机，特征非逐位可复现）。
-- `--tokenizer` / `--predictor`：权重来源，默认 `NeoQuasar/Kronos-Tokenizer-base` / `NeoQuasar/Kronos-base`，可换成微调后的本地目录。
+- `--tokenizer` / `--predictor`：权重来源，默认 `AI-ModelScope/Kronos-Tokenizer-base` / `AI-ModelScope/Kronos-base`（失败自动回退 HF 的 `NeoQuasar/...`），可换成微调后的本地目录。
+- `--model-source`：模型源优先级（`modelscope`/`hf`，默认 `modelscope`）。
 - `--out` / `--report`：输出与报告路径，默认 `{data-root}/kronos_features.csv` 与 `{data-root}/kronos_features_report.json`。
 - `--max-context`（默认 512）：与 `--lookback` 共同受模型上限约束，**`lookback ≤ max-context ≤ 512`**。
 - **产物**：
@@ -274,8 +275,8 @@ for s in ['train','validation','test']:\
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py `
     --price-csv finetune_csv\data\A_000001_daily.csv `
-    --tokenizer NeoQuasar/Kronos-Tokenizer-base `
-    --predictor NeoQuasar/Kronos-base `
+  --tokenizer AI-ModelScope/Kronos-Tokenizer-base `
+  --predictor AI-ModelScope/Kronos-base `
     --out data\kronos_features_000001.csv `
     --symbol 000001 --lookback 90 --pred 5 --samples 30
 ```
@@ -468,6 +469,8 @@ print("数据自检通过")
 ```
 
 - 一条命令内部自动串联：生成 Kronos 特征 → 融合 + 切分 → 训练 C1（LightGBM 优先，未装回退 Ridge）→ 打包。
+- `--tokenizer` / `--predictor` 默认分别为 `AI-ModelScope/Kronos-Tokenizer-base` / `AI-ModelScope/Kronos-base`；可不传。
+- `--model-source modelscope|hf` 控制模型源优先级（默认 modelscope，失败自动回退 hf）。
 - `--backend auto|lightgbm|ridge`（默认 auto）。
 - **产物 bundle 目录** `runs/fusion_000001/`：
 
@@ -562,7 +565,7 @@ print("数据自检通过")
 ```
 
 - 只需历史价量（**≥ lookback 根**）+ 当日可得因子；脚本自动**外推未来时间戳**（频率无关），对最新窗口多次采样 → C1 打分。
-- 若 bundle 未记录权重路径，可用 `--tokenizer`/`--predictor` 覆盖；`--device` 选推理设备（见第 13 节）。
+- 若 bundle 未记录权重路径，可用 `--tokenizer`/`--predictor` 覆盖；`--model-source` 控制优先源（默认 modelscope）；`--device` 选推理设备（见第 13 节）。
 - 输出（对未来 `horizon` 日收益的方向与幅度）：
 
 ```json
@@ -636,8 +639,9 @@ python -c "import torch; print('cuda', torch.cuda.is_available(), torch.cuda.get
 
 ### 11.3 数据与权重迁移
 
-- **预训练权重**：首次 `from_pretrained("NeoQuasar/...")` 会自动下载到 HuggingFace 缓存；
-  离线机可把本机 `~/.cache/huggingface/`（Windows `%USERPROFILE%\.cache\huggingface`）整体拷过去，或用本地微调权重目录（`--tokenizer/--predictor` 指向）。
+- **预训练权重**：默认先从 ModelScope 下载（`AI-ModelScope/...`），失败再回退 HF（`NeoQuasar/...`）。
+  离线机可预置缓存：ModelScope（常见 `~/.cache/modelscope/`）和 HF（`~/.cache/huggingface/`）；
+  Windows 对应 `%USERPROFILE%\.cache\modelscope\` 与 `%USERPROFILE%\.cache\huggingface\`。
 - **数据**：`DataSet/dataC` 已 gitignore，**不会随 git 同步**。两种选择：
   1. **重建（推荐）**：在 GPU 机上重跑步骤 1（`build_dataC_step1_from_quantia.py`）——需该机能连 Quantia DB / cache。
   2. **拷贝**：把本机 `DataSet/dataC/{train,validation,test}` 打包传到 GPU 机相同相对路径。
@@ -717,8 +721,9 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
     ```bash
     rsync -avz user@winhost:/c/xapproject/Quantia/Kronos/DataSet/dataC/ ./DataSet/dataC/
     ```
-- **预训练权重**：首次 `from_pretrained` 自动下载到 `~/.cache/huggingface`；离线机把 Windows 的
-  `%USERPROFILE%\.cache\huggingface` 拷到 Linux `~/.cache/huggingface`，或用本地权重目录传 `--tokenizer/--predictor`。
+- **预训练权重**：默认先尝试 ModelScope，再回退 HF。离线机建议同时预置
+  `~/.cache/modelscope` 与 `~/.cache/huggingface`；Windows 可从 `%USERPROFILE%\.cache\modelscope\` 和
+  `%USERPROFILE%\.cache\huggingface\` 拷到 Linux 对应目录，或直接传本地权重目录（`--tokenizer/--predictor`）。
 - **硬编码路径**：步骤 1 的 `--quantia-root`/`--cache-hist-root` 默认值是 Windows 路径，Linux 上**显式传 Linux 路径**：
   ```bash
   .venv/bin/python finetune_csv/build_dataC_step1_from_quantia.py \

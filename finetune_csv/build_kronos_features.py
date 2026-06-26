@@ -35,6 +35,11 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 
 from model import Kronos, KronosTokenizer, KronosPredictor  # noqa: E402
+from kronos_loader import (  # noqa: E402
+    DEFAULT_PREDICTOR_MS,
+    DEFAULT_TOKENIZER_MS,
+    load_kronos_predictor,
+)
 
 _PRICE_COLS = ["open", "high", "low", "close", "volume", "amount"]
 
@@ -141,8 +146,12 @@ def _smoke_test() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="用 Kronos 批量生成预测衍生特征（方案 C）")
     parser.add_argument("--price-csv", help="价格 CSV（timestamps + OHLCV + amount）")
-    parser.add_argument("--tokenizer", help="预训练 / 微调后的 tokenizer 目录")
-    parser.add_argument("--predictor", help="预训练 / 微调后的主模型目录")
+    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_MS,
+                        help="tokenizer 来源（默认 ModelScope ID；本地目录也可）")
+    parser.add_argument("--predictor", default=DEFAULT_PREDICTOR_MS,
+                        help="predictor 来源（默认 ModelScope ID；本地目录也可）")
+    parser.add_argument("--model-source", choices=["modelscope", "hf"], default="modelscope",
+                        help="模型源优先级（默认 modelscope，失败自动回退 hf）")
     parser.add_argument("--out", help="输出特征 CSV 路径")
     parser.add_argument("--symbol", default="UNKNOWN", help="标的代码")
     parser.add_argument("--lookback", type=int, default=90)
@@ -156,13 +165,19 @@ def main() -> None:
         _smoke_test()
         return
 
-    required = [args.price_csv, args.tokenizer, args.predictor, args.out]
+    required = [args.price_csv, args.out]
     if any(v is None for v in required):
-        parser.error("非 --smoke 模式下必须提供 --price-csv --tokenizer --predictor --out")
+        parser.error("非 --smoke 模式下必须提供 --price-csv --out")
 
-    tok = KronosTokenizer.from_pretrained(args.tokenizer)
-    mdl = Kronos.from_pretrained(args.predictor)
-    predictor = KronosPredictor(mdl, tok, device=args.device, max_context=512)
+    predictor, load_meta = load_kronos_predictor(
+        tokenizer_src=args.tokenizer,
+        predictor_src=args.predictor,
+        device=args.device,
+        max_context=512,
+        prefer_source=args.model_source,
+        verbose=True,
+    )
+    print("[build_kronos_features] loaded:", load_meta)
 
     px = pd.read_csv(args.price_csv)
     feats = build_features(predictor, px, symbol=args.symbol,

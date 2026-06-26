@@ -176,9 +176,9 @@ def main() -> None:
     if any(v is None for v in required):
         parser.error("非 --smoke 模式下必须提供 --kronos --factors --price --out-dir")
 
-    kf = pd.read_csv(args.kronos)
-    ff = pd.read_csv(args.factors)
-    px = pd.read_csv(args.price)
+    kf = pd.read_csv(args.kronos, dtype={"symbol": str})
+    ff = pd.read_csv(args.factors, dtype={"symbol": str})
+    px = pd.read_csv(args.price, dtype={"symbol": str})
     df = build_fusion(kf, ff, px, horizon=args.horizon)
     tr, va, te = time_split(df, train_end=args.train_end, val_end=args.val_end)
 

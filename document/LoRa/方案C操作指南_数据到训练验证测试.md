@@ -24,7 +24,7 @@ flowchart TD
 | --- | --- | --- | --- |
 | 1 数据准备 | —（你提供） | 价量 CSV、因子 CSV | — |
 | 2 生成 Kronos 特征 | `build_dataC_step2_kronos_features.py`（批量编排）<br/>`build_kronos_features.py`（单标的/底层） | `DataSet/dataC/kronos_features.csv` | `... build_kronos_features.py --smoke` |
-| 3 融合 + 切分 | `build_fusion_dataset.py` | `fusion_{all,train,val,test}.csv` | `... build_fusion_dataset.py --smoke` |
+| 3 融合 + 切分 | `build_dataC_step3_fusion.py`（dataC 编排）<br/>`build_fusion_dataset.py`（单文件/底层） | `DataSet/dataC/fusion_{all,train,val,test}.csv` | `... build_fusion_dataset.py --smoke` |
 | 4 数据自检 | 内联脚本（本文 4 节） | 校验通过 | — |
 | 5 选型 | `compare_fusion_strategies.py` | `fusion_selection.json` | `... compare_fusion_strategies.py --smoke` |
 | 6 训练打包 | `run_fusion.py train` | bundle 目录 | `... run_fusion.py smoke` |
@@ -277,20 +277,72 @@ for s in ['train','validation','test']:\
 
 ## 4. 步骤 3：对齐因子 + 标签 → 融合宽表并按时间切分
 
+step2 的 `kronos_features.csv` 是**多标的**表，其日期窗口通常**横跨 dataC 的 validation 尾部与 test**。
+因此推荐用编排脚本 `build_dataC_step3_fusion.py`，它会自动合并 `validation+test` 的 `factors.csv`/`price.csv`、
+只保留 kronos 覆盖到的标的、对齐打标签并按时间切分：
+
+### 4.1 推荐入口：dataC 融合编排脚本
+
+```powershell
+.\.venv\Scripts\python.exe finetune_csv\build_dataC_step3_fusion.py `
+    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+    --horizon 5
+```
+
+- `--sources`（默认 `validation,test`）：从哪些 split 读取因子/价格并纵向合并。
+- `--horizon`：未来收益标签天数 H（与 step2 的 `--pred` 对齐，常用 5）。
+- `--train-end` / `--val-end`：显式切分边界（不含）。**留空则按唯一交易日 70/15/15 自动分位切分**
+  （比例可用 `--train-frac`/`--val-frac` 调）。**生产/全年数据建议显式指定边界**（见第 4.3 节）。
+- **产物**（写入 `--data-root`）：
+    - `fusion_all.csv` + `fusion_train/val/test.csv`（列结构完全一致）
+    - `fusion_report.json`（行数 / 切分边界 / 标签列 / 因子列 / 标的）
+
+> **本次 demo 实跑**：1210 行 kronos → 融合 1200 行（末尾 10 行因 H=5 无未来标签被 dropna），
+> 自动切分 `train < 2026-04-22 ≤ val < 2026-05-21 ≤ test` = 831/179/190；44 列、0 NaN、时间无重叠。
+
+- **标签**：`label_fwd_ret_5d = close.shift(-5)/close - 1`，**按 symbol 分组**计算（防跨标的串期）。
+- **切分**：按时间先后（禁止随机打乱）；`val`/`test` 不与 `train` 在时间上重叠。
+- **因子合并** `how="left"`（以 kronos 行为基准）；dataC 因子表本身 NaN-free，故融合后无缺失。
+
+### 4.2 底层入口：单文件版（调试 / 你自己已拼好三表时）
+
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\build_fusion_dataset.py `
     --kronos DataSet\dataC\kronos_features.csv `
-    --factors DataSet\dataC\test\factors.csv `
-    --price DataSet\dataC\test\price.csv `
+    --factors <已合并好的因子CSV> `
+    --price <已合并好的价格CSV> `
     --out-dir data `
-    --horizon 5 --train-end 2024-01-01 --val-end 2025-01-01
+    --horizon 5 --train-end 2026-04-22 --val-end 2026-05-21
 ```
 
-- **标签**：`label_fwd_ret_5d = close.shift(-5)/close - 1`，**按 symbol 分组**计算（防跨标的串期）。
-- **切分**：按时间先后，`train < 2024-01-01 ≤ val < 2025-01-01 ≤ test`（禁止随机打乱）。
-- **产物**：`fusion_all.csv` + `fusion_train.csv` / `fusion_val.csv` / `fusion_test.csv`，三者列结构完全相同。
+> 单文件版**不会**自动合并 val+test，需自行保证 `--factors`/`--price` 覆盖 kronos 的全部日期+未来 H 天；
+> 否则越界日期会因缺标签被 dropna。已修复 symbol 以字符串读入（避免 `000001→1`）。冒烟：`... build_fusion_dataset.py --smoke`。
 
-终端会打印类似：`融合 N 行 -> train/val/test = a/b/c`。
+### 4.3 全年数据 / GPU / 生产环境注意事项
+
+当把规模从 demo（10 只 × 120 天）扩到**全年 / 全市场**时，按下面顺序与约束执行：
+
+1. **先重跑 step2 生成全年 kronos 特征（GPU）**——这是耗时大头：
+   ```powershell
+   .\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
+       --device cuda:0 --max-symbols 300 --recent-days 250 --samples 30
+   ```
+   - `--recent-days 250` ≈ 一个完整交易年；`--samples` 越大特征越稳（生产建议 ≥30）。
+   - 断点续跑：`_kronos_parts/` + `--skip-existing` 默认开，中断不丢已完成标的。
+   - GPU 提速量级见第 3.2 节；全市场全历史建议改用 `KronosPredictor.predict_batch` 多标的并行。
+2. **再跑 step3 融合**——step3 是纯 CPU、向量化的对齐/切分，**对全年数据无需改动**，
+   只是 `--sources` 要覆盖 kronos 的日期跨度（横跨更多 split 时写 `validation,test` 或加更多）。
+3. **切分边界显式化**：全年数据**不要**依赖自动 70/15/15，应按真实日历显式指定
+   `--train-end`/`--val-end`（例如季度/月度边界），保证可复现、与回测口径一致。
+4. **防泄漏（生产关键）**：
+   - 标签用未来 H 天收益，**最近 H 个交易日没有标签**——这些行只能用于"上线预测"，不可进训练集。
+   - 切分严格按时间，`test` 必须晚于 `val` 晚于 `train`；选型只在 `val` 上做（见第 8 节）。
+   - 因子的"截止可用时点"要与预测日一致（基本面用 `report_date` 的 as-of 对齐，已在 step1 处理）。
+5. **环境兼容性**：
+   - GPU 与 CPU 产出的 kronos 特征会因采样随机性**有数值差异**，但分布一致；固定 `--seed` 仅固定选股，
+     采样路径仍随机，故**特征不是逐位可复现**——生产中应固定模型版本 + 记录 `fusion_report.json`/`kronos_features_report.json` 以追溯。
+   - `--device auto` 在无 GPU 机器上自动回退 CPU，脚本可在生产/CI 中无差别运行。
+   - 大规模时注意磁盘：`DataSet/dataC` 已 gitignore（demo 即 4.5GB），生产产物应落在独立数据盘并定期归档。
 
 ---
 

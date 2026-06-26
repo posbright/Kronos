@@ -27,11 +27,11 @@ flowchart TD
 | 3 融合 + 切分 | `build_dataC_step3_fusion.py`（dataC 编排）<br/>`build_fusion_dataset.py`（单文件/底层） | `DataSet/dataC/fusion_{all,train,val,test}.csv` | `... build_fusion_dataset.py --smoke` |
 | 4 数据自检 | 内联脚本（本文 4 节） | 校验通过 | — |
 | 5 选型 | `compare_fusion_strategies.py` | `fusion_selection.json` | `... compare_fusion_strategies.py --smoke` |
-| 6 训练打包 | `run_fusion.py train` | bundle 目录 | `... run_fusion.py smoke` |
+| 6 训练打包 | `train_c1_bundle.py`（多标的/主线）<br/>`run_fusion.py train`（单标的） | bundle 目录 | `... train_c1_bundle.py --smoke` |
 | 7 评估 | 训练日志 / bundle 的 `manifest.json` | val/test 指标 | — |
 | 8 上线预测 | `run_fusion.py predict` | `latest_prediction.json` | 同上 smoke |
 
-> **建议先把 5 个 `--smoke` 跑一遍**（见第 9 节），确认环境无误后再上真实数据。
+> **建议先把 6 个 `--smoke` 跑一遍**（见第 10 节），确认环境无误后再上真实数据。
 
 ---
 
@@ -424,11 +424,35 @@ print("数据自检通过")
 
 > **重要区分（避免踩坑）**：`run_fusion.py train` 是**单标的、端到端**入口——它从一份 `--price-csv` + `--factors`
 > **自己重新生成 Kronos 特征**再训练打包，**不会**消费 step3 产出的多标的 `fusion_*.csv`。
-> 因此：
-> - **单标的快速打包/上线**：用下面 `run_fusion.py train`（自带特征生成 → 融合 → 训练 → bundle）。
-> - **多标的 dataC（本指南主线）**：step5 的 `compare_fusion_strategies.py` 已在 `fusion_*.csv` 上完成
->   C1 训练 + val 选型 + test 评估，可直接据其 `--out-json` 结论上线；若要多标的**可部署 bundle**，
->   需在 `fusion_*.csv` 上单独训练 C1（按 `manifest` 约定保存），暂未提供多标的 bundle 一键脚本。
+> 因此本指南给两条路：
+> - **A. 多标的 dataC（本指南主线）**：用 `train_c1_bundle.py` 直接吃 step3 的多标的 `fusion_*.csv` 训练并打包
+>   可部署 bundle（见 7.1）。
+> - **B. 单标的快速打包/上线**：用 `run_fusion.py train`（自带特征生成 → 融合 → 训练 → bundle，见 7.2）。
+
+### 7.1 多标的 C1 bundle 训练（本指南主线，推荐）
+
+`train_c1_bundle.py` 消费 step3 产出的 `fusion_{train,val,test}.csv`，训练 C1 下游模型并打包成
+**与 `run_fusion.py` 完全一致的 bundle**（`manifest.json` + `c1_lgb.txt`/`c1_ridge.npz`），可被服务侧
+`C1Model.load` 直接加载：
+
+```powershell
+.\.venv\Scripts\python.exe finetune_csv\train_c1_bundle.py `
+    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+    --out-bundle runs\dataC_c1 --horizon 5
+```
+
+- `--data-root`：自动找 `fusion_{train,val,test}.csv`；也可用 `--train/--val/--test` 显式指定三份文件。
+- `--horizon`（或 `--label`）：标签列，与 step3 对齐（给 `--horizon 5` 即用 `label_fwd_ret_5d`）。
+- `--backend auto|lightgbm|ridge`（默认 auto，LightGBM 优先）；`--kronos-cols` 默认 `k_pred_ret,k_up_prob,k_pred_vol`。
+- 特征列**自动识别**：除 `date/symbol/label` 外全部为特征（kronos 列排前），无需手列因子名。
+- **评估口径**：池化 `IC/RankIC/RMSE/Hit` + **按交易日截面再平均**的 `IC_by_date/RankIC_by_date`（多标的更合理）。
+- **产物 bundle** `runs/dataC_c1/`：`manifest.json`（含 `multi_symbol/n_symbols/symbols/feat_cols/metrics`）+ `c1_lgb.txt` 或 `c1_ridge.npz`。
+- 冒烟：`... train_c1_bundle.py --smoke`（合成多标的数据跑通 train→save→load）。
+
+> **demo 实跑**：10 只 × 41 特征，train/val/test=831/179/190，val IC=-0.070、test IC=-0.131
+> （**负 IC 是极小数据的过拟合伪象**，与 step5 的 C1 完全一致；生产需用全市场/全年数据复核）。
+
+### 7.2 单标的端到端打包（备选）
 
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\run_fusion.py train `
@@ -507,7 +531,7 @@ print("数据自检通过")
 
 ---
 
-## 10. 先跑通：5 个冒烟自测（强烈建议）
+## 10. 先跑通：6 个冒烟自测（强烈建议）
 
 任何一步上真实数据前，先确认管线本身没问题（**无需权重 / 外部文件**）：
 
@@ -516,6 +540,7 @@ print("数据自检通过")
 .\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py --smoke
 .\.venv\Scripts\python.exe finetune_csv\build_fusion_dataset.py --smoke
 .\.venv\Scripts\python.exe finetune_csv\compare_fusion_strategies.py --smoke
+.\.venv\Scripts\python.exe finetune_csv\train_c1_bundle.py --smoke
 .\.venv\Scripts\python.exe finetune_csv\run_fusion.py smoke
 ```
 

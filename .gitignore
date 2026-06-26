@@ -78,3 +78,6 @@ tmp/
 # Generated 方案C datasets (large, do not commit)
 DataSet/dataC/
 DataSet/dataC_dbcheck/
+
+# Generated model bundles / run outputs
+runs/

@@ -38,6 +38,12 @@
 
     # 冒烟自测（无需任何文件 / 权重，合成多标的 fusion 数据跑通 train→save→load）
     python finetune_csv/train_c1_bundle.py --smoke
+
+    # 上线打分（步骤8）：用训练好的多标的 bundle 对最新截面打分选股
+    python finetune_csv/train_c1_bundle.py --predict \
+        --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC \
+        --out-bundle runs/dataC_c1 --top 10 \
+        --out-json runs/dataC_c1/latest_ranking.json
 """
 
 import argparse
@@ -144,6 +150,69 @@ def train_bundle(tr: pd.DataFrame, va: pd.DataFrame, te: pd.DataFrame, *,
     return manifest
 
 
+def predict_bundle(bundle_dir: str, features_csv: str, *, as_of=None,
+                   top: int = 10, out_json: str = None) -> dict:
+    """上线打分：加载多标的 C1 bundle，对某一交易日的全市场截面打分并排序选股。
+
+    与 run_fusion.py predict 的区别：run_fusion 是**单标的**、从 price-csv 现算 Kronos 特征；
+    本函数针对**多标的 dataC bundle**，直接消费已算好的特征宽表（fusion_*.csv 同结构），
+    对指定日（默认最新一天）的全部标的横截面打分 → 输出按预测收益排序的选股清单。
+    """
+    with open(os.path.join(bundle_dir, "manifest.json"), encoding="utf-8") as f:
+        manifest = json.load(f)
+    feat_cols = manifest["feat_cols"]
+    label = manifest.get("label")
+    model = C1Model.load(bundle_dir, manifest["backend"], feat_cols)
+
+    df = pd.read_csv(features_csv, dtype={"symbol": str}, parse_dates=["date"])
+    missing = [c for c in feat_cols if c not in df.columns]
+    if missing:
+        raise SystemExit(f"特征文件缺少 bundle 所需列: {missing}")
+
+    as_of_ts = pd.to_datetime(as_of).normalize() if as_of else df["date"].max()
+    cross = df[df["date"] == as_of_ts].copy()
+    if cross.empty:
+        raise SystemExit(f"特征文件中无 {as_of_ts.date()} 这一天的截面数据")
+
+    cross["pred_fwd_ret"] = model.predict(cross[feat_cols].values)
+    cross = cross.sort_values("pred_fwd_ret", ascending=False).reset_index(drop=True)
+    cross["rank"] = np.arange(1, len(cross) + 1)
+
+    def _row(r):
+        d = {"rank": int(r["rank"]), "symbol": str(r["symbol"]),
+             "pred_fwd_ret": float(r["pred_fwd_ret"]),
+             "direction": "up" if r["pred_fwd_ret"] > 0 else "down"}
+        for c in ("k_up_prob", "k_pred_vol"):
+            if c in cross.columns:
+                d[c] = float(r[c])
+        if label and label in cross.columns and pd.notna(r[label]):
+            d["realized_fwd_ret"] = float(r[label])      # 仅当截面带标签时给出（回看参考）
+        return d
+
+    ranked = [_row(r) for _, r in cross.iterrows()]
+    horizon_days = None
+    if label and label.startswith("label_fwd_ret_") and label.endswith("d"):
+        try:
+            horizon_days = int(label[len("label_fwd_ret_"):-1])
+        except ValueError:
+            horizon_days = None
+
+    out = {
+        "as_of_date": str(as_of_ts.date()),
+        "horizon_days": horizon_days,
+        "backend": manifest["backend"],
+        "multi_symbol": manifest.get("multi_symbol", True),
+        "n_symbols": int(len(cross)),
+        "long_candidates": ranked[:top],            # 预测最强（做多候选）
+        "short_candidates": ranked[-top:][::-1],    # 预测最弱（规避/做空候选）
+    }
+    if out_json:
+        os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+    return out
+
+
 def _print_metrics(metrics: dict) -> None:
     for split in ("val", "test"):
         m = metrics.get(split)
@@ -215,10 +284,40 @@ def main() -> None:
     ap.add_argument("--backend", default="auto", choices=["auto", "lightgbm", "ridge"])
     ap.add_argument("--out-bundle", default="runs/dataC_c1", help="bundle 输出目录")
     ap.add_argument("--smoke", action="store_true", help="运行无需文件的冒烟自测")
+    ap.add_argument("--predict", action="store_true",
+                    help="上线打分模式：加载 --out-bundle 的 bundle 对截面特征打分选股")
+    ap.add_argument("--features", default=None,
+                    help="打分用特征宽表 CSV（默认 {data-root}/fusion_all.csv）")
+    ap.add_argument("--as-of", default=None, help="打分的交易日（YYYY-MM-DD，默认取最新一天）")
+    ap.add_argument("--top", type=int, default=10, help="多空候选各取前 N 只")
+    ap.add_argument("--out-json", default=None, help="打分结果落盘路径")
     args = ap.parse_args()
 
     if args.smoke:
         _smoke_test()
+        return
+
+    if args.predict:
+        features = args.features or (
+            str(Path(args.data_root) / "fusion_all.csv") if args.data_root else None)
+        if not features:
+            raise SystemExit("请用 --features 或 --data-root 指定打分用特征宽表")
+        out = predict_bundle(args.out_bundle, features, as_of=args.as_of,
+                             top=args.top, out_json=args.out_json)
+        print(f"[predict] 截面打分 {out['as_of_date']}（{out['n_symbols']} 只，"
+              f"后端={out['backend']}，H={out['horizon_days']}日）")
+        print("  做多候选（预测最强）:")
+        for r in out["long_candidates"]:
+            extra = f" 实际={r['realized_fwd_ret']:+.4f}" if "realized_fwd_ret" in r else ""
+            print(f"    #{r['rank']:>2} {r['symbol']} 预测={r['pred_fwd_ret']:+.4f} "
+                  f"{r['direction']} 上涨概率={r.get('k_up_prob', float('nan')):.2f}{extra}")
+        print("  规避/做空候选（预测最弱）:")
+        for r in out["short_candidates"]:
+            extra = f" 实际={r['realized_fwd_ret']:+.4f}" if "realized_fwd_ret" in r else ""
+            print(f"    #{r['rank']:>2} {r['symbol']} 预测={r['pred_fwd_ret']:+.4f} "
+                  f"{r['direction']}{extra}")
+        if args.out_json:
+            print(f"[predict] 结果已写入 {args.out_json}")
         return
 
     label = f"label_fwd_ret_{args.horizon}d" if args.horizon else args.label

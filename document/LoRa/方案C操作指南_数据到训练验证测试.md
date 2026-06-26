@@ -29,7 +29,7 @@ flowchart TD
 | 5 选型 | `compare_fusion_strategies.py` | `fusion_selection.json` | `... compare_fusion_strategies.py --smoke` |
 | 6 训练打包 | `train_c1_bundle.py`（多标的/主线）<br/>`run_fusion.py train`（单标的） | bundle 目录 | `... train_c1_bundle.py --smoke` |
 | 7 评估 | 训练日志 / bundle 的 `manifest.json` | val/test 指标 | — |
-| 8 上线预测 | `run_fusion.py predict` | `latest_prediction.json` | 同上 smoke |
+| 8 上线预测 | `train_c1_bundle.py --predict`（多标的截面选股/主线）<br/>`run_fusion.py predict`（单标的） | `latest_ranking.json` / `latest_prediction.json` | 同上 smoke |
 
 > **建议先把 6 个 `--smoke` 跑一遍**（见第 10 节），确认环境无误后再上真实数据。
 
@@ -503,6 +503,54 @@ print("数据自检通过")
 
 ## 9. 步骤 8：上线预测未来走势
 
+> **两条上线路径**，与步骤 6 的两种 bundle 一一对应：
+> - **A. 多标的截面打分（本指南主线）**：`train_c1_bundle.py --predict` 吃**已算好的特征宽表**，
+>   对某交易日全市场横截面打分排序 → 选股清单（见 9.1）。
+> - **B. 单标的端到端**：`run_fusion.py predict` 从一份 price-csv **现算 Kronos 特征**再打分（见 9.2）。
+>
+> 二者 bundle **不可混用**：多标的 bundle 的 `manifest.json` 无 `lookback/symbol` 字段、特征列含全部因子，
+> 只能走 9.1；单标的 bundle 记录了 `lookback/pred/samples`，只能走 9.2。
+
+### 9.1 多标的截面打分（主线，配合 `train_c1_bundle.py` 的 bundle）
+
+```powershell
+.\.venv\Scripts\python.exe finetune_csv\train_c1_bundle.py --predict `
+    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+    --out-bundle runs\dataC_c1 `
+    --top 10 `
+    --out-json runs\dataC_c1\latest_ranking.json
+```
+
+- `--predict`：切到打分模式（不训练），从 `--out-bundle` 加载 `manifest.json` + 模型。
+- `--features`（默认 `{data-root}/fusion_all.csv`）：打分用的特征宽表，列必须包含 bundle 的 `feat_cols`。
+- `--as-of`（默认取宽表中最新一天）：指定打分交易日 `YYYY-MM-DD`。
+- `--top`（默认 10）：多空候选各取前 N 只。
+- `--out-json`：排序结果落盘。
+- 输出（按预测未来 H 日收益排序的选股清单）：
+
+```json
+{
+  "as_of_date": "2026-06-16", "horizon_days": 5, "backend": "lightgbm",
+  "multi_symbol": true, "n_symbols": 10,
+  "long_candidates": [
+    {"rank": 1, "symbol": "601619", "pred_fwd_ret": 0.0890, "direction": "up",
+     "k_up_prob": 1.0, "k_pred_vol": 0.02, "realized_fwd_ret": -0.1014}
+  ],
+  "short_candidates": [ ... ]
+}
+```
+
+- `long_candidates`/`short_candidates`：预测最强 / 最弱的标的（做多 / 规避候选）。
+- `realized_fwd_ret`：仅当截面带标签时给出（回看校验用；真正上线的"最新预测日"无标签）。
+- **真正上线时**：用最新一根 K 线（最近 H 天**无标签**）现算特征拼成同结构宽表喂 `--features`；
+  demo 里用的是 `fusion_all.csv` 的最新一天（带标签，仅作流程演示）。
+
+> **本次 demo 实跑**（`--top 5`）：`as_of=2026-06-16`，10 只截面打分，预测方向与实际**普遍相反**
+> （预测 up 多数实际 down）——这是 831 行极小数据**过拟合 + 截面太窄**的必然结果，
+> **不是模型缺陷**，换全市场/全年数据并参考第 13 节优化后即改善。
+
+### 9.2 单标的端到端预测（配合 `run_fusion.py train` 的 bundle）
+
 ```powershell
 .\.venv\Scripts\python.exe finetune_csv\run_fusion.py predict `
     --bundle runs\fusion_000001 `
@@ -512,6 +560,7 @@ print("数据自检通过")
 ```
 
 - 只需历史价量（**≥ lookback 根**）+ 当日可得因子；脚本自动**外推未来时间戳**（频率无关），对最新窗口多次采样 → C1 打分。
+- 若 bundle 未记录权重路径，可用 `--tokenizer`/`--predictor` 覆盖；`--device` 选推理设备（见第 12 节）。
 - 输出（对未来 `horizon` 日收益的方向与幅度）：
 
 ```json
@@ -526,7 +575,7 @@ print("数据自检通过")
 
 部署形态：
 - **离线批量**：收盘后用任务计划跑一次 `predict`，结果落库 / 推下游。
-- **常驻服务**：把 `load_bundle` + `predict_latest` 包成 Flask/FastAPI（参考 `webui/`），**进程启动时加载一次权重**，请求只跑推理。
+- **常驻服务**：把 `load_bundle` + `predict_latest`（或 9.1 的 `predict_bundle`）包成 Flask/FastAPI（参考 `webui/`），**进程启动时加载一次权重**，请求只跑推理。
 - **更新节奏**：价量每日增量重算特征；C1 模型按月 / 季滚动 `train` 重训覆盖 bundle，并用步骤 5 定期复核 C1 是否仍优于 C2 兜底。
 
 ---
@@ -550,7 +599,118 @@ print("数据自检通过")
 
 ---
 
-## 11. 常见问题 / 排错
+## 11. GPU 服务器迁移：前置条件与环境准备
+
+> 本机 CPU 足以跑通全流程与小规模 demo；当需要**全市场 / 全年**特征时（步骤 2 是唯一耗时大头），
+> 把 step2 搬到 GPU 服务器。其余步骤（3~8）仍是纯 CPU、向量化，**无需改动**。
+
+### 11.1 前置条件（硬件 / 驱动）
+
+- **NVIDIA GPU + 驱动**：`nvidia-smi` 能正常输出；记下 CUDA 驱动版本。
+- **显存**：Kronos-base/small 权重很小（数百 MB 级），单卡 8GB 足够；显存越大可放大 `predict_batch` 批量。
+- **磁盘**：全市场全年 kronos 特征 + 中间产物可达数十 GB，预留独立数据盘。
+
+### 11.2 环境准备（在 GPU 服务器上，逐条执行）
+
+```bash
+# 1) 取代码（与本机同一仓库）
+git clone https://github.com/posbright/Kronos.git && cd Kronos
+
+# 2) 建独立虚拟环境（不要直接拷本机 .venv，CPU 版 torch 不能用 GPU）
+python -m venv .venv && source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
+
+# 3) 装 CUDA 版 PyTorch（按服务器 CUDA 版本选 index-url，cu121 示例）
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# 4) 装其余依赖
+pip install -r requirements.txt
+
+# 5) 验证 GPU 可见
+python -c "import torch; print('cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+> **关键坑**：本机 `.venv` 里是 `torch x.x+cpu`，**直接复制到 GPU 机器仍只会用 CPU**。
+> 必须在 GPU 机器上重建环境并装 **CUDA 版 torch**（第 3 步），用第 5 步确认 `cuda True`。
+
+### 11.3 数据与权重迁移
+
+- **预训练权重**：首次 `from_pretrained("NeoQuasar/...")` 会自动下载到 HuggingFace 缓存；
+  离线机可把本机 `~/.cache/huggingface/`（Windows `%USERPROFILE%\.cache\huggingface`）整体拷过去，或用本地微调权重目录（`--tokenizer/--predictor` 指向）。
+- **数据**：`DataSet/dataC` 已 gitignore，**不会随 git 同步**。两种选择：
+  1. **重建（推荐）**：在 GPU 机上重跑步骤 1（`build_dataC_step1_from_quantia.py`）——需该机能连 Quantia DB / cache。
+  2. **拷贝**：把本机 `DataSet/dataC/{train,validation,test}` 打包传到 GPU 机相同相对路径。
+- **DB 连通性**：若走重建路线，确认 GPU 机能访问 `QUANTIA_DB_*`（先 `--check-db` 验证，见 2.1）。
+
+### 11.4 在 GPU 上运行 step2（放大规模）
+
+```bash
+python finetune_csv/build_dataC_step2_kronos_features.py \
+    --device cuda:0 --max-symbols 300 --recent-days 250 --samples 30 --skip-existing
+```
+
+- `--device cuda:0`：显式 GPU；无 CUDA 会自动回退 CPU 并告警（见 3.2）。
+- 断点续跑默认开（`_kronos_parts/` + `--skip-existing`），中断不丢已完成标的。
+- 全市场全历史建议改用 `KronosPredictor.predict_batch` 多标的并行（见 3.2 末尾）。
+- 跑完把 `DataSet/dataC/kronos_features.csv` 带回（或就地继续步骤 3~8）。
+
+---
+
+## 12. GPU 训练 / CPU 推理：可行性与最佳实践
+
+> **结论先行：完全可行，且推荐"GPU 离线、CPU 上线"。** 训练阶段的 GPU 只加速 step2 的 Kronos 采样；
+> 下游 C1 模型与上线打分本就在 CPU 上跑。
+
+**为什么 CPU 推理没问题：**
+
+- **C1 bundle 是纯 CPU 产物**：`c1_lgb.txt`（LightGBM）/ `c1_ridge.npz`（numpy）与设备无关，
+  加载即在 CPU 上 `predict`，毫秒级，**不依赖 GPU**。
+- **Kronos 权重设备无关**：`state_dict` 同一份，`KronosPredictor(..., device="cpu")` 与 `cuda:0` 加载的是同一组权重，
+  数值上一致（差异只来自**采样随机性**，与设备无关）。
+- **两条上线路径的算力需求不同**：
+  - **9.1 多标的截面打分**：吃**预先算好的特征宽表**，上线时**根本不调用 Kronos**，只是一次 LightGBM 截面 `predict` → 纯 CPU、亚毫秒，最适合常驻服务。
+  - **9.2 单标的端到端**：上线时要现算 Kronos 特征（每样本 CPU ≈ 0.75s）→ 日频 / 低频单标的 **CPU 足够**；
+    若要对**很多标的**实时打分，应把"算特征"放到 GPU 离线批处理，上线只走 9.1。
+
+**推荐生产形态（GPU 离线 + CPU 上线）：**
+
+| 阶段 | 设备 | 频率 | 内容 |
+| --- | --- | --- | --- |
+| 特征生成（step2） | **GPU** | 每日收盘后批量 | 全市场最新窗口 Kronos 特征，落特征宽表 |
+| 模型重训（step6） | CPU/GPU 均可 | 按月 / 季 | `train_c1_bundle.py` 重训覆盖 bundle |
+| 上线打分（step8） | **CPU** | 实时 / 盘后 | 9.1 加载 bundle 对最新截面 `predict` 选股 |
+
+> **最佳实践**：上线机只需 **CPU 版 torch + lightgbm + bundle + 当日特征宽表**，无需 GPU。
+> 把 step2 的"重算"与 step8 的"打分"解耦——GPU 算特征落盘，CPU 服务读盘打分——既省成本又稳。
+
+---
+
+## 13. 效果不理想时的优化空间（提升预测准确性）
+
+> demo（10 只 × 120 天）的负 IC **不代表方案本身无效**，而是**数据太小 + 截面太窄**导致严重过拟合。
+> 下面按"杠杆从大到小"排列优化方向。
+
+1. **扩大数据规模（最大杠杆）**：从 10 只 × 120 天扩到**全市场 × 多年**。
+   样本量上去后，41 维特征不再过拟合，截面 IC 才有统计意义（先做第 11~12 节的 GPU 迁移）。
+2. **提升 Kronos 特征质量**：`--samples` 调大（生产 ≥30，越大方向概率越稳）、`--lookback` 调优（≤512）、
+   用 `predict_batch` 在 GPU 上负担更大规模与更高采样。
+3. **因子工程（截面类任务最关键）**：
+   - **截面标准化**：每个交易日内对因子做 z-score / 去极值（winsorize），消除跨日量纲漂移。
+   - **中性化**：对行业、市值做回归取残差，避免模型只学到风格暴露。
+   - **因子筛选**：算单因子 IC / IC 衰减、去冗余（相关性 > 0.8 的留一个），剔除无效因子（见 FAQ"IC 为负"）。
+4. **标签工程**：`--horizon` 对齐你的交易周期；用**超额收益**（减基准 / 行业均值）做标签，
+   让模型学截面相对强弱而非大盘 beta；必要时改用分位 / 排序标签。
+5. **模型调参与正则**：LightGBM 调 `num_leaves / learning_rate / min_child_samples / feature_fraction`、
+   加 `early_stopping`（用 val 集）、`lambda_l1/l2` 正则；样本/特征比偏小时降低模型复杂度。
+6. **选型与集成**：用步骤 5 定期对照 **C1 vs C2**；可对**多 horizon / 多随机种子**的预测做集成（stacking / 平均）降方差。
+7. **评估口径**：以**按交易日截面 IC**（`IC_by_date`，见 7.1）而非池化 IC 为准；
+   最终用**回测**（年化 / 夏普 / 最大回撤 / 分组多空）验证增益，而不仅看 IC。
+8. **防过拟合纪律**：滚动重训 + 样本外稳定性检查；特征数远小于样本数；选型只在 val、test 只看一次（第 5 节）。
+
+> **一句话**：demo 的目标是"跑通流程"；要"预测准"，**先加数据规模 + 截面标准化/中性化 + 调参**，再谈精调。
+
+---
+
+## 14. 常见问题 / 排错
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |

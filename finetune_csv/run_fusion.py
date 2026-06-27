@@ -56,8 +56,8 @@ from build_fusion_dataset import (build_fusion, time_split,  # noqa: E402
                                   _FFILL_FACTORS, _ZERO_FACTORS)
 from compare_fusion_strategies import _metrics, _HAS_LGB  # noqa: E402
 from kronos_loader import (  # noqa: E402
-    DEFAULT_PREDICTOR_MS,
-    DEFAULT_TOKENIZER_MS,
+    DEFAULT_PREDICTOR_LOCAL,
+    DEFAULT_TOKENIZER_LOCAL,
     load_kronos_predictor,
 )
 
@@ -329,8 +329,8 @@ def cmd_train(args):
 
 def cmd_predict(args):
     model, manifest = load_bundle(args.bundle)
-    tok_src = args.tokenizer or manifest.get("tokenizer_src") or DEFAULT_TOKENIZER_MS
-    mdl_src = args.predictor or manifest.get("predictor_src") or DEFAULT_PREDICTOR_MS
+    tok_src = args.tokenizer or manifest.get("tokenizer_src") or DEFAULT_TOKENIZER_LOCAL
+    mdl_src = args.predictor or manifest.get("predictor_src") or DEFAULT_PREDICTOR_LOCAL
     if not tok_src or not mdl_src:
         raise SystemExit("缺少 tokenizer/predictor 路径：bundle 未记录且未通过 --tokenizer/--predictor 提供")
     predictor, _ = _load_predictor(tok_src, mdl_src, args.device, args.model_source)
@@ -390,10 +390,10 @@ def main():
     pt = sub.add_parser("train", help="训练并打包 C1 模型 bundle")
     pt.add_argument("--price-csv", required=True)
     pt.add_argument("--factors", required=True)
-    pt.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_MS,
-                    help="tokenizer 来源（默认 ModelScope ID，可传本地目录）")
-    pt.add_argument("--predictor", default=DEFAULT_PREDICTOR_MS,
-                    help="predictor 来源（默认 ModelScope ID，可传本地目录）")
+    pt.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_LOCAL,
+                    help="tokenizer 默认目录（model/pretrained/Kronos-Tokenizer-base；缺失则走远端）")
+    pt.add_argument("--predictor", default=DEFAULT_PREDICTOR_LOCAL,
+                    help="predictor 默认目录（model/pretrained/Kronos-base；缺失则走远端）")
     pt.add_argument("--out-bundle", required=True)
     pt.add_argument("--symbol", default="UNKNOWN")
     pt.add_argument("--lookback", type=int, default=90)

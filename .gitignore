@@ -81,3 +81,6 @@ DataSet/dataC_dbcheck/
 
 # Generated model bundles / run outputs
 runs/
+
+# Local default Kronos model store (contains large safetensors)
+model/pretrained/

@@ -11,11 +11,19 @@ from __future__ import annotations
 from pathlib import Path
 
 
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
+MODEL_STORE_ROOT = _REPO_ROOT / "model" / "pretrained"
+
+
 DEFAULT_TOKENIZER_MS = "AI-ModelScope/Kronos-Tokenizer-base"
 DEFAULT_PREDICTOR_MS = "AI-ModelScope/Kronos-base"
 
 DEFAULT_TOKENIZER_HF = "NeoQuasar/Kronos-Tokenizer-base"
 DEFAULT_PREDICTOR_HF = "NeoQuasar/Kronos-base"
+
+DEFAULT_TOKENIZER_LOCAL = str(MODEL_STORE_ROOT / "Kronos-Tokenizer-base")
+DEFAULT_PREDICTOR_LOCAL = str(MODEL_STORE_ROOT / "Kronos-base")
 
 
 def _provider_order(prefer_source: str) -> list[str]:
@@ -28,16 +36,23 @@ def _provider_order(prefer_source: str) -> list[str]:
 def _map_default_source(src: str, asset: str, provider: str) -> str:
     if asset == "tokenizer":
         ms, hf = DEFAULT_TOKENIZER_MS, DEFAULT_TOKENIZER_HF
+        local_default = DEFAULT_TOKENIZER_LOCAL
     else:
         ms, hf = DEFAULT_PREDICTOR_MS, DEFAULT_PREDICTOR_HF
+        local_default = DEFAULT_PREDICTOR_LOCAL
 
-    if not src or src in (ms, hf):
+    # If src is empty / canonical remote ID / default local path, resolve by provider.
+    if not src or src in (ms, hf, local_default):
         return ms if provider == "modelscope" else hf
     return src
 
 
 def _load_one(loader_cls, src: str, asset: str, prefer_source: str, verbose: bool):
     src = (src or "").strip()
+
+    if not src:
+        src = DEFAULT_TOKENIZER_LOCAL if asset == "tokenizer" else DEFAULT_PREDICTOR_LOCAL
+
     local = Path(src)
     if src and local.exists():
         if verbose:
@@ -55,10 +70,11 @@ def _load_one(loader_cls, src: str, asset: str, prefer_source: str, verbose: boo
         try:
             if verbose:
                 print(f"[model] {asset}: trying {provider} -> {resolved}")
+            MODEL_STORE_ROOT.mkdir(parents=True, exist_ok=True)
             if provider == "modelscope":
-                obj = loader_cls.from_modelscope(resolved)
+                obj = loader_cls.from_modelscope(resolved, cache_dir=str(MODEL_STORE_ROOT))
             else:
-                obj = loader_cls.from_pretrained(resolved)
+                obj = loader_cls.from_pretrained(resolved, cache_dir=str(MODEL_STORE_ROOT))
             if verbose:
                 print(f"[model] {asset}: loaded from {provider} -> {resolved}")
             return obj, {"provider": provider, "source": resolved}

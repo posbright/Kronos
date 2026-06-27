@@ -36,8 +36,8 @@ import torch  # noqa: E402
 
 from model import Kronos, KronosTokenizer, KronosPredictor  # noqa: E402
 from kronos_loader import (  # noqa: E402
-    DEFAULT_PREDICTOR_MS,
-    DEFAULT_TOKENIZER_MS,
+    DEFAULT_PREDICTOR_LOCAL,
+    DEFAULT_TOKENIZER_LOCAL,
     load_kronos_predictor,
 )
 
@@ -146,10 +146,10 @@ def _smoke_test() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="用 Kronos 批量生成预测衍生特征（方案 C）")
     parser.add_argument("--price-csv", help="价格 CSV（timestamps + OHLCV + amount）")
-    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_MS,
-                        help="tokenizer 来源（默认 ModelScope ID；本地目录也可）")
-    parser.add_argument("--predictor", default=DEFAULT_PREDICTOR_MS,
-                        help="predictor 来源（默认 ModelScope ID；本地目录也可）")
+    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_LOCAL,
+                        help="tokenizer 默认目录（model/pretrained/Kronos-Tokenizer-base；缺失则走远端）")
+    parser.add_argument("--predictor", default=DEFAULT_PREDICTOR_LOCAL,
+                        help="predictor 默认目录（model/pretrained/Kronos-base；缺失则走远端）")
     parser.add_argument("--model-source", choices=["modelscope", "hf"], default="modelscope",
                         help="模型源优先级（默认 modelscope，失败自动回退 hf）")
     parser.add_argument("--out", help="输出特征 CSV 路径")

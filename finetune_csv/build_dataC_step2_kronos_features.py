@@ -59,8 +59,8 @@ for p in (str(_THIS_DIR), str(_REPO_ROOT)):
 
 from build_kronos_features import build_features  # noqa: E402
 from kronos_loader import (  # noqa: E402
-    DEFAULT_PREDICTOR_MS,
-    DEFAULT_TOKENIZER_MS,
+    DEFAULT_PREDICTOR_LOCAL,
+    DEFAULT_TOKENIZER_LOCAL,
     load_kronos_predictor,
 )
 
@@ -121,10 +121,10 @@ _PER_CALL_SEC = {"cpu": 0.75, "cuda": 0.05, "mps": 0.15}
 def main() -> None:
     ap = argparse.ArgumentParser(description="方案C 第2步：Kronos 衍生特征（CPU 子集版）")
     ap.add_argument("--data-root", default="C:/xapproject/Quantia/Kronos/DataSet/dataC")
-    ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_MS,
-                    help="tokenizer 来源（默认 ModelScope ID；本地目录也可）")
-    ap.add_argument("--predictor", default=DEFAULT_PREDICTOR_MS,
-                    help="predictor 来源（默认 ModelScope ID；本地目录也可）")
+    ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_LOCAL,
+                    help="tokenizer 默认目录（model/pretrained/Kronos-Tokenizer-base；缺失则走远端）")
+    ap.add_argument("--predictor", default=DEFAULT_PREDICTOR_LOCAL,
+                    help="predictor 默认目录（model/pretrained/Kronos-base；缺失则走远端）")
     ap.add_argument("--model-source", choices=["modelscope", "hf"], default="modelscope",
                     help="模型源优先级（默认 modelscope，失败自动回退 hf）")
     ap.add_argument("--out", default="")

@@ -3,8 +3,10 @@
 > 本文是**可照着敲的操作手册**（runbook），把方案 C（外部融合 / C1 主线）的全流程拆成可复制粘贴的命令。
 > 设计原理与字段含义见 [方案C_外部融合集成.md](方案C_外部融合集成.md)；本文只讲**怎么一步步做**。
 >
-> 适用环境：Windows + 仓库根目录 `.venv` 虚拟环境（CPU 即可）。命令中的 Python 一律用 `.\.venv\Scripts\python.exe`。
-> **Linux / GPU 服务器**：脚本与参数完全一致，只需替换 shell 写法（激活 venv / 解释器 / 路径）——详见**第 12 节 Windows → Linux 环境切换**。
+> 适用环境：仓库根目录 `.venv` 虚拟环境（CPU 即可）。**本文命令均用相对路径 + 正斜杠 `/`，跨平台通用**：
+> 先在仓库根目录激活 venv（Linux/macOS `source .venv/bin/activate`；Windows `.\.venv\Scripts\Activate.ps1`），之后直接用 `python`。
+> 如未激活，把 `python` 换成 `.venv/bin/python`（Linux/macOS）或 `.\.venv\Scripts\python.exe`（Windows）即可。
+> Windows 下多行命令的换行符把 `\` 换成反引号 `` ` ``，**或直接照抄第 12.6 节整理好的 PowerShell 全流程**。详见**第 12 节**。
 
 ---
 
@@ -24,6 +26,7 @@ flowchart TD
 | 步骤 | 脚本 | 产物 | 自测命令 |
 | --- | --- | --- | --- |
 | 1 数据准备 | —（你提供） | 价量 CSV、因子 CSV | — |
+| 1.5 大文件拆分（可选） | `split_dataC_parts.py`（按 symbol 拆 N 份，可选） | `factors.part*.csv` / `price.part*.csv` | — |
 | 2 生成 Kronos 特征 | `build_dataC_step2_kronos_features.py`（批量编排）<br/>`build_kronos_features.py`（单标的/底层） | `DataSet/dataC/kronos_features.csv` | `... build_kronos_features.py --smoke` |
 | 3 融合 + 切分 | `build_dataC_step3_fusion.py`（dataC 编排）<br/>`build_fusion_dataset.py`（单文件/底层） | `DataSet/dataC/fusion_{all,train,val,test}.csv` | `... build_fusion_dataset.py --smoke` |
 | 4 数据自检 | 内联脚本（本文 4 节） | 校验通过 | — |
@@ -38,20 +41,19 @@ flowchart TD
 
 ## 1. 环境准备
 
-```powershell
-# 进入仓库根目录
-cd C:\xapproject\Quantia\Kronos
+```bash
+# 进入仓库根目录（改成你本地的仓库路径）
+cd /path/to/Kronos          # Windows: cd C:\xapproject\Quantia\Kronos
 
-# 激活虚拟环境（PowerShell）
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
-.\.venv\Scripts\Activate.ps1
+# 激活虚拟环境
+source .venv/bin/activate    # Windows(PowerShell): .\.venv\Scripts\Activate.ps1
 
-# 确认依赖（必需 torch；lightgbm 可选，未装自动回退 numpy Ridge）
-.\.venv\Scripts\python.exe -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+# 确认依赖（torch 必需；lightgbm/pyyaml 已含于 requirements.txt，未装 lightgbm 也会自动回退 numpy Ridge）
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 ```
 
 - **CPU 即可推理**（实测 `torch 2.x+cpu`）。GPU 仅加速 Kronos 多采样，非必需。
-- **Linux 用户**：把上面的 `.\.venv\Scripts\Activate.ps1` / `.\.venv\Scripts\python.exe` 换成 `source .venv/bin/activate` / `.venv/bin/python`，其余命令参数不变（完整对照见第 12 节）。
+- 下文命令均在**仓库根目录**运行，路径都是**相对路径**；未激活 venv 时把 `python` 换成 `.venv/bin/python`（Linux）或 `.\.venv\Scripts\python.exe`（Windows）。
 - **预训练权重**：方案 C 把 Kronos 当纯预测器，需要一份 tokenizer + 主模型。默认走**魔塔优先、HF 兜底**：`AI-ModelScope/Kronos-Tokenizer-base` + `AI-ModelScope/Kronos-base`（失败自动回退 `NeoQuasar/...`）；也可传你微调后的本地权重目录。
 
 ---
@@ -64,7 +66,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 
 该脚本会按你的要求完成：
 
-- 从 `C:/xapproject/Quantia/Quantia/quantia/cache/hist` 拉取全量价量（cache 优先）。
+- 从 Quantia 项目的 `quantia/cache/hist` 拉取全量价量（cache 优先，默认 `../Quantia/quantia/cache/hist`）。
 - 以最新日期为锚点（可显式指定 `--anchor-date 2026-06-24`）向前回推切分 train/validation/test。
 - 输出到 `DataSet/dataC/{train,validation,test}/`，每个 split 含：
     - `price.csv`：`date,symbol,open,high,low,close,volume,amount`
@@ -73,25 +75,25 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 
 ### 2.1 一条命令构建（按 6/24 向前切分）
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\build_dataC_step1_from_quantia.py `
-        --quantia-root C:/xapproject/Quantia/Quantia `
-        --cache-hist-root C:/xapproject/Quantia/Quantia/quantia/cache/hist `
-        --out-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
-        --anchor-date 2026-06-24 `
-        --end-date 2026-06-24 `
-        --val-days 180 `
+```bash
+python finetune_csv/build_dataC_step1_from_quantia.py \
+        --quantia-root ../Quantia \
+        --cache-hist-root ../Quantia/quantia/cache/hist \
+        --out-root DataSet/dataC \
+        --anchor-date 2026-06-24 \
+        --end-date 2026-06-24 \
+        --val-days 180 \
         --test-days 180
 ```
 
-    脚本默认会读取 `C:/xapproject/Quantia/Quantia/.env` 的 `QUANTIA_DB_*` 配置，并**优先使用远程 DB**。
+    脚本默认会读取 `{quantia-root}/.env` 的 `QUANTIA_DB_*` 配置，并**优先使用远程 DB**。
     当系统环境变量里有本地 DB 配置时，脚本会用项目 `.env` 覆盖当前进程，避免误连本地库。
 
     可先做连通性验证（不构建数据）：
 
-    ```powershell
-    .\.venv\Scripts\python.exe finetune_csv\build_dataC_step1_from_quantia.py `
-        --quantia-root C:/xapproject/Quantia/Quantia `
+    ```bash
+    python finetune_csv/build_dataC_step1_from_quantia.py \
+        --quantia-root ../Quantia \
         --check-db
     ```
 
@@ -159,7 +161,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 > 历史训练区间（2017→2025）的技术因子由本地重算 `local_*` 提供；
 > `cn_stock_financial`（财务因子 `fin_*`）覆盖全历史，默认参与并按披露日 asof 对齐。
 
-你后续若接入 `C:/xapproject/Quantia/Quantia` 的不同环境，只需改参数，不需要改代码路径。
+你后续若接入不同环境的 Quantia 项目，只需改参数（`--quantia-root` 等），不需要改代码路径。
 
 ### 2.4 输出目录结构
 
@@ -168,8 +170,8 @@ DataSet/
     dataC/
         split_report.json
         train/
-            price.csv
-            factors.csv
+            price.csv          # 或拆分后的 price.part01.csv ... price.part05.csv
+            factors.csv        # 或拆分后的 factors.part01.csv ... factors.part10.csv
         validation/
             price.csv
             factors.csv
@@ -178,13 +180,32 @@ DataSet/
             factors.csv
 ```
 
+> **大文件可拆分（见第 2.6 节）**：train 的 `factors.csv`（约 3.3 GB）/ `price.csv`（约 560 MB）
+> 可按 symbol 拆成多份小文件，便于上传 / 管理；step3 会**自动识别单文件或 part 分片**，用法不变。
+
+### 2.6 大文件拆分（可选，便于上传 / 管理）
+
+训练集单文件过大（`factors.csv` 数 GB）时上传、备份、传输都不便。提供脚本按 **symbol** 把大 CSV
+拆成 N 份小文件（**同一只股票永远落在同一份，不跨文件**），流式逐行写出，内存占用极低，可处理千万级行：
+
+```bash
+# factors.csv 拆 10 份；price.csv 拆 5 份（约 110 MB/份）
+python finetune_csv/split_dataC_parts.py --file DataSet/dataC/train/factors.csv --parts 10
+python finetune_csv/split_dataC_parts.py --file DataSet/dataC/train/price.csv  --parts 5
+```
+
+- 产物与原文件同目录：`factors.part01.csv … factors.part10.csv`、`price.part01.csv … price.part05.csv`（每份带表头）。
+- 拆完确认无误后可删原文件（或加 `--remove-source` 拆完即删）：`Remove-Item DataSet/dataC/train/factors.csv`。
+- **向前兼容**：原单文件存在时 step3 仍优先读单文件；删除后自动读取 `*.part*.csv` 全部分片合并，**命令与产物完全不变**。
+- 校验：10 份合计行数应等于原文件行数（脚本运行末尾会打印总行数）。
+
 ### 2.5 快速自检（建议每次构建后执行）
 
 推荐使用专用校验脚本（检查 schema / NaN / OHLC 一致性 / 行对齐 / 时间切分不重叠 / 因子覆盖）：
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\examples\validate_dataC.py `
-    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+```bash
+python finetune_csv/examples/validate_dataC.py \
+    --data-root DataSet/dataC \
     --expect-anchor 2026-06-24
 ```
 
@@ -192,8 +213,8 @@ DataSet/
 
 如需极简内联检查，也可：
 
-```powershell
-.\.venv\Scripts\python.exe -c "import pandas as pd; \
+```bash
+python -c "import pandas as pd; \
 from pathlib import Path; root=Path('DataSet/dataC'); \
 for s in ['train','validation','test']:\
  p=pd.read_csv(root/s/'price.csv', dtype={'symbol':str}); f=pd.read_csv(root/s/'factors.csv', dtype={'symbol':str});\
@@ -216,10 +237,10 @@ for s in ['train','validation','test']:\
 由于 Kronos 是**逐窗自回归**推理，CPU 上单次 `predict` 约 0.75s，全市场全历史不可行（20 只全历史 ≈ 11 天）。
 因此提供编排脚本 `build_dataC_step2_kronos_features.py`，对 dataC **随机子集 + 最近时间窗**批量生成，并支持**断点续跑**：
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
-    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
-    --max-symbols 10 --recent-days 120 `
+```bash
+python finetune_csv/build_dataC_step2_kronos_features.py \
+    --data-root DataSet/dataC \
+    --max-symbols 10 --recent-days 120 \
     --lookback 90 --pred 5 --samples 10 --seed 42
 ```
 
@@ -246,13 +267,13 @@ for s in ['train','validation','test']:\
 
 脚本通过 `--device` 选择设备，默认 `auto`（**优先 GPU → MPS → CPU** 自动检测）：
 
-```powershell
+```bash
 # CPU（无 GPU 时 auto 即 CPU；也可显式 --device cpu）
-.\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
-    --data-root .../DataSet/dataC --max-symbols 10 --recent-days 120 --samples 10
+python finetune_csv/build_dataC_step2_kronos_features.py \
+    --data-root DataSet/dataC --max-symbols 10 --recent-days 120 --samples 10
 
 # GPU：显存足够时可放大规模（更多标的 / 更长时间窗 / 更高 samples）
-.\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
+python finetune_csv/build_dataC_step2_kronos_features.py \
     --device cuda:0 --max-symbols 100 --recent-days 500 --samples 30
 ```
 
@@ -272,12 +293,12 @@ for s in ['train','validation','test']:\
 
 编排脚本内部复用 `build_kronos_features.py` 的 `build_features`。如只想对单只 CSV 调试，可直接：
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py `
-    --price-csv finetune_csv\data\A_000001_daily.csv `
-  --tokenizer AI-ModelScope/Kronos-Tokenizer-base `
-  --predictor AI-ModelScope/Kronos-base `
-    --out data\kronos_features_000001.csv `
+```bash
+python finetune_csv/build_kronos_features.py \
+    --price-csv finetune_csv/data/A_000001_daily.csv \
+    --tokenizer AI-ModelScope/Kronos-Tokenizer-base \
+    --predictor AI-ModelScope/Kronos-base \
+    --out data/kronos_features_000001.csv \
     --symbol 000001 --lookback 90 --pred 5 --samples 30
 ```
 
@@ -286,8 +307,8 @@ for s in ['train','validation','test']:\
 
 ### 3.4 冒烟自测
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py --smoke
+```bash
+python finetune_csv/build_kronos_features.py --smoke
 ```
 
 ---
@@ -298,11 +319,14 @@ step2 的 `kronos_features.csv` 是**多标的**表，其日期窗口通常**横
 因此推荐用编排脚本 `build_dataC_step3_fusion.py`，它会自动合并 `validation+test` 的 `factors.csv`/`price.csv`、
 只保留 kronos 覆盖到的标的、对齐打标签并按时间切分：
 
+> **自动识别拆分文件**：每个 split 的 `factors`/`price` 既可是单文件 `factors.csv`，也可是按 symbol 拆分的
+> `factors.part*.csv`（见第 2.6 节）。step3 优先用单文件，缺失时自动读取并合并全部 `part` 分片，命令无需改动。
+
 ### 4.1 推荐入口：dataC 融合编排脚本
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\build_dataC_step3_fusion.py `
-    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
+```bash
+python finetune_csv/build_dataC_step3_fusion.py \
+    --data-root DataSet/dataC \
     --horizon 5
 ```
 - `--data-root`（默认 `DataSet/dataC`）：dataC 根目录；`--kronos`（默认 `{data-root}/kronos_features.csv`）；step2 产物路径。
@@ -323,12 +347,12 @@ step2 的 `kronos_features.csv` 是**多标的**表，其日期窗口通常**横
 
 ### 4.2 底层入口：单文件版（调试 / 你自己已拼好三表时）
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\build_fusion_dataset.py `
-    --kronos DataSet\dataC\kronos_features.csv `
-    --factors <已合并好的因子CSV> `
-    --price <已合并好的价格CSV> `
-    --out-dir data `
+```bash
+python finetune_csv/build_fusion_dataset.py \
+    --kronos DataSet/dataC/kronos_features.csv \
+    --factors <已合并好的因子CSV> \
+    --price <已合并好的价格CSV> \
+    --out-dir data \
     --horizon 5 --train-end 2026-04-22 --val-end 2026-05-21
 ```
 
@@ -340,12 +364,13 @@ step2 的 `kronos_features.csv` 是**多标的**表，其日期窗口通常**横
 当把规模从 demo（10 只 × 120 天）扩到**全年 / 全市场**时，按下面顺序与约束执行：
 
 1. **先重跑 step2 生成全年 kronos 特征（GPU）**——这是耗时大头：
-   ```powershell
-   .\.venv\Scripts\python.exe finetune_csv\build_dataC_step2_kronos_features.py `
+   ```bash
+   python finetune_csv/build_dataC_step2_kronos_features.py \
        --device cuda:0 --max-symbols 300 --recent-days 250 --samples 30
    ```
    - `--recent-days 250` ≈ 一个完整交易年；`--samples` 越大特征越稳（生产建议 ≥30）。
    - 断点续跑：`_kronos_parts/` + `--skip-existing` 默认开，中断不丢已完成标的。
+   - **全市场**：`--max-symbols 0` 一次跑全 6000 只；或分批用 `--symbol-offset 0/300/600...`（同 seed 不重叠），汇总为同一份特征后统一训一个模型。
    - GPU 提速量级见第 3.2 节；全市场全历史建议改用 `KronosPredictor.predict_batch` 多标的并行。
 2. **再跑 step3 融合**——step3 是纯 CPU、向量化的对齐/切分，**对全年数据无需改动**，
    只是 `--sources` 要覆盖 kronos 的日期跨度（横跨更多 split 时写 `validation,test` 或加更多）。
@@ -401,14 +426,14 @@ print("数据自检通过")
 
 `compare_fusion_strategies.py` 直接消费 step3 产出的 `fusion_{train,val,test}.csv`（多标的兼容）：
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\compare_fusion_strategies.py `
-    --train DataSet\dataC\fusion_train.csv --val DataSet\dataC\fusion_val.csv --test DataSet\dataC\fusion_test.csv `
-    --kronos-cols k_pred_ret,k_up_prob,k_pred_vol `
-    --factor-cols amplitude,quote_change,ups_downs,turnover,local_ret_1d,local_ret_5d,local_ma_5,local_ma_10,local_ma_20,local_vol_ma_5,local_amt_ma_5,local_hl_spread,local_oc_change,fin_eps,fin_bps,fin_roe,fin_roa `
-    --label label_fwd_ret_5d `
-    --switch-threshold 0.005 `
-    --out-json DataSet\dataC\fusion_selection.json
+```bash
+python finetune_csv/compare_fusion_strategies.py \
+    --train DataSet/dataC/fusion_train.csv --val DataSet/dataC/fusion_val.csv --test DataSet/dataC/fusion_test.csv \
+    --kronos-cols k_pred_ret,k_up_prob,k_pred_vol \
+    --factor-cols amplitude,quote_change,ups_downs,turnover,local_ret_1d,local_ret_5d,local_ma_5,local_ma_10,local_ma_20,local_vol_ma_5,local_amt_ma_5,local_hl_spread,local_oc_change,fin_eps,fin_bps,fin_roe,fin_roa \
+    --label label_fwd_ret_5d \
+    --switch-threshold 0.005 \
+    --out-json DataSet/dataC/fusion_selection.json
 ```
 
 - `--kronos-cols` / `--factor-cols`：参与融合的 Kronos 特征列 / 外部因子列（逗号分隔，必须是 `fusion_*.csv` 中真实存在的列名）。
@@ -438,10 +463,10 @@ print("数据自检通过")
 **与 `run_fusion.py` 完全一致的 bundle**（`manifest.json` + `c1_lgb.txt`/`c1_ridge.npz`），可被服务侧
 `C1Model.load` 直接加载：
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\train_c1_bundle.py `
-    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
-    --out-bundle runs\dataC_c1 --horizon 5
+```bash
+python finetune_csv/train_c1_bundle.py \
+    --data-root DataSet/dataC \
+    --out-bundle runs/dataC_c1 --horizon 5
 ```
 
 - `--data-root`：自动找 `fusion_{train,val,test}.csv`；也可用 `--train/--val/--test` 显式指定三份文件。
@@ -457,14 +482,14 @@ print("数据自检通过")
 
 ### 7.2 单标的端到端打包（备选）
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\run_fusion.py train `
-    --price-csv finetune_csv\data\A_000001_daily.csv `
-    --factors data\factors_000001.csv `
-    --tokenizer pretrained\Kronos-Tokenizer-base `
-    --predictor pretrained\Kronos-base `
-    --out-bundle runs\fusion_000001 `
-    --symbol 000001 --lookback 90 --pred 5 --samples 30 --horizon 5 `
+```bash
+python finetune_csv/run_fusion.py train \
+    --price-csv finetune_csv/data/A_000001_daily.csv \
+    --factors data/factors_000001.csv \
+    --tokenizer pretrained/Kronos-Tokenizer-base \
+    --predictor pretrained/Kronos-base \
+    --out-bundle runs/fusion_000001 \
+    --symbol 000001 --lookback 90 --pred 5 --samples 30 --horizon 5 \
     --train-end 2024-01-01 --val-end 2025-01-01
 ```
 
@@ -493,8 +518,8 @@ print("数据自检通过")
 
 也可随时查 bundle 里的指标：
 
-```powershell
-.\.venv\Scripts\python.exe -c "import json;print(json.dumps(json.load(open(r'runs/fusion_000001/manifest.json',encoding='utf-8'))['metrics'],ensure_ascii=False,indent=2))"
+```bash
+python -c "import json;print(json.dumps(json.load(open('runs/fusion_000001/manifest.json',encoding='utf-8'))['metrics'],ensure_ascii=False,indent=2))"
 ```
 
 评估口径：
@@ -518,12 +543,12 @@ print("数据自检通过")
 
 ### 9.1 多标的截面打分（主线，配合 `train_c1_bundle.py` 的 bundle）
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\train_c1_bundle.py --predict `
-    --data-root C:/xapproject/Quantia/Kronos/DataSet/dataC `
-    --out-bundle runs\dataC_c1 `
-    --top 10 `
-    --out-json runs\dataC_c1\latest_ranking.json
+```bash
+python finetune_csv/train_c1_bundle.py --predict \
+    --data-root DataSet/dataC \
+    --out-bundle runs/dataC_c1 \
+    --top 10 \
+    --out-json runs/dataC_c1/latest_ranking.json
 ```
 
 - `--predict`：切到打分模式（不训练），从 `--out-bundle` 加载 `manifest.json` + 模型。
@@ -556,12 +581,12 @@ print("数据自检通过")
 
 ### 9.2 单标的端到端预测（配合 `run_fusion.py train` 的 bundle）
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\run_fusion.py predict `
-    --bundle runs\fusion_000001 `
-    --price-csv finetune_csv\data\A_000001_daily.csv `
-    --factors data\factors_000001.csv `
-    --out-json runs\fusion_000001\latest_prediction.json
+```bash
+python finetune_csv/run_fusion.py predict \
+    --bundle runs/fusion_000001 \
+    --price-csv finetune_csv/data/A_000001_daily.csv \
+    --factors data/factors_000001.csv \
+    --out-json runs/fusion_000001/latest_prediction.json
 ```
 
 - 只需历史价量（**≥ lookback 根**）+ 当日可得因子；脚本自动**外推未来时间戳**（频率无关），对最新窗口多次采样 → C1 打分。
@@ -589,13 +614,13 @@ print("数据自检通过")
 
 任何一步上真实数据前，先确认管线本身没问题（**无需权重 / 外部文件**）：
 
-```powershell
-.\.venv\Scripts\python.exe finetune_csv\build_dataC_step1_from_quantia.py --smoke
-.\.venv\Scripts\python.exe finetune_csv\build_kronos_features.py --smoke
-.\.venv\Scripts\python.exe finetune_csv\build_fusion_dataset.py --smoke
-.\.venv\Scripts\python.exe finetune_csv\compare_fusion_strategies.py --smoke
-.\.venv\Scripts\python.exe finetune_csv\train_c1_bundle.py --smoke
-.\.venv\Scripts\python.exe finetune_csv\run_fusion.py smoke
+```bash
+python finetune_csv/build_dataC_step1_from_quantia.py --smoke
+python finetune_csv/build_kronos_features.py --smoke
+python finetune_csv/build_fusion_dataset.py --smoke
+python finetune_csv/compare_fusion_strategies.py --smoke
+python finetune_csv/train_c1_bundle.py --smoke
+python finetune_csv/run_fusion.py smoke
 ```
 
 全部出现「通过」字样即环境就绪。`run_fusion.py smoke` 会完整跑 train→save→load→predict 并打印一条示例预测。
@@ -778,10 +803,52 @@ source .venv/bin/activate
 
 ---
 
-## 13. GPU 训练 / CPU 推理：可行性与最佳实践
+## 12.6 Windows PowerShell 上跑全流程（直接照抄）
 
-> **结论先行：完全可行，且推荐"GPU 离线、CPU 上线"。** 训练阶段的 GPU 只加速 step2 的 Kronos 采样；
-> 下游 C1 模型与上线打分本就在 CPU 上跑。
+> Windows 命令与 Linux **脚本/参数完全一致**，只差两点：换行符用反引号 `` ` ``（不是 `\`），
+> 未激活 venv 时把 `python` 换成 `.\.venv\Scripts\python.exe`。正斜杠路径在 PowerShell 下同样可用。
+
+```powershell
+# 激活虚拟环境
+.\.venv\Scripts\Activate.ps1
+
+# 步骤1：从 Quantia 构建价量/因子（首次或更新数据时）
+python finetune_csv/build_dataC_step1_from_quantia.py `
+    --quantia-root ../Quantia `
+    --cache-hist-root ../Quantia/quantia/cache/hist `
+    --out-root DataSet/dataC `
+    --anchor-date 2026-06-24 --val-days 180 --test-days 180
+
+# 步骤2：生成 Kronos 特征（有 GPU 用 --device cuda:0，无则去掉或 --device cpu）
+python finetune_csv/build_dataC_step2_kronos_features.py `
+    --data-root DataSet/dataC --device cuda:0 `
+    --max-symbols 300 --recent-days 250 --samples 30 --skip-existing
+
+# 步骤3：融合 + 切分
+python finetune_csv/build_dataC_step3_fusion.py `
+    --data-root DataSet/dataC --horizon 5
+
+# 步骤5：选型
+python finetune_csv/compare_fusion_strategies.py `
+    --train DataSet/dataC/fusion_train.csv --val DataSet/dataC/fusion_val.csv `
+    --test DataSet/dataC/fusion_test.csv --label label_fwd_ret_5d `
+    --out-json DataSet/dataC/fusion_selection.json
+
+# 步骤6：训练多标的 C1 bundle
+python finetune_csv/train_c1_bundle.py `
+    --data-root DataSet/dataC --out-bundle runs/dataC_c1 --horizon 5
+
+# 步骤8：上线截面打分
+python finetune_csv/train_c1_bundle.py --predict `
+    --data-root DataSet/dataC --out-bundle runs/dataC_c1 `
+    --top 10 --out-json runs/dataC_c1/latest_ranking.json
+```
+
+> 单行命令（如 `split_dataC_parts.py`、`--smoke` 自测）在 PowerShell 直接照抄即可，无需改换行符。
+> GPU 提速可换批并行版 `build_dataC_step2_kronos_features_batch.py`（6G 加 `--batch-size 96`、8G 加 192）。
+
+---
+
 
 **为什么 CPU 推理没问题：**
 
@@ -851,19 +918,19 @@ source .venv/bin/activate
 
 确认 smoke 通过、数据就绪后，真实流程其实就两条命令（选型可选）：
 
-```powershell
+```bash
 # 训练打包（内部已含特征生成 + 融合切分）
-.\.venv\Scripts\python.exe finetune_csv\run_fusion.py train `
-    --price-csv <价量csv> --factors <因子csv> `
-    --tokenizer <tokenizer目录> --predictor <主模型目录> `
-    --out-bundle runs\fusion_<symbol> --symbol <symbol> `
-    --lookback 90 --pred 5 --samples 30 --horizon 5 `
+python finetune_csv/run_fusion.py train \
+    --price-csv <价量csv> --factors <因子csv> \
+    --tokenizer <tokenizer目录> --predictor <主模型目录> \
+    --out-bundle runs/fusion_<symbol> --symbol <symbol> \
+    --lookback 90 --pred 5 --samples 30 --horizon 5 \
     --train-end 2024-01-01 --val-end 2025-01-01
 
 # 上线预测
-.\.venv\Scripts\python.exe finetune_csv\run_fusion.py predict `
-    --bundle runs\fusion_<symbol> --price-csv <最新价量csv> --factors <因子csv> `
-    --out-json runs\fusion_<symbol>\latest_prediction.json
+python finetune_csv/run_fusion.py predict \
+    --bundle runs/fusion_<symbol> --price-csv <最新价量csv> --factors <因子csv> \
+    --out-json runs/fusion_<symbol>/latest_prediction.json
 ```
 
 > 想分阶段细粒度控制 / 复核选型，则按第 3→9 节逐步执行；`run_fusion.py` 把它们封装成了生产主线。

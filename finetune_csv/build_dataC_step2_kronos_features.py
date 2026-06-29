@@ -82,14 +82,19 @@ def _load_recent_price(data_root: Path) -> pd.DataFrame:
     return out
 
 
-def _pick_symbols(price: pd.DataFrame, need: int, n: int, seed: int) -> List[str]:
+def _pick_symbols(price: pd.DataFrame, need: int, n: int, seed: int, offset: int = 0) -> List[str]:
+    """选标的：按 seed 固定打乱全部合格标的，再取 [offset, offset+n) 一段。
+
+    - ``n<=0``：取全市场全部（仅由 offset 偏移）。
+    - ``offset``：分批训练用。同一 seed 下 0/300/600... 递进可不重叠覆盖全市场。
+    """
     counts = price.groupby("symbol").size()
     candidates = sorted(counts[counts >= need].index.tolist())
     if not candidates:
         raise RuntimeError(f"无标的满足最少 {need} 行的历史长度要求")
-    rng = np.random.default_rng(seed)
-    k = min(n, len(candidates))
-    chosen = rng.choice(candidates, size=k, replace=False)
+    order = np.random.default_rng(seed).permutation(candidates)
+    k = len(order) if n <= 0 else min(n, len(order))
+    chosen = order[offset:offset + k] if n > 0 else order[offset:]
     return sorted(map(str, chosen))
 
 
@@ -120,7 +125,7 @@ _PER_CALL_SEC = {"cpu": 0.75, "cuda": 0.05, "mps": 0.15}
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="方案C 第2步：Kronos 衍生特征（CPU 子集版）")
-    ap.add_argument("--data-root", default="C:/xapproject/Quantia/Kronos/DataSet/dataC")
+    ap.add_argument("--data-root", default="DataSet/dataC")
     ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_LOCAL,
                     help="tokenizer 默认目录（model/pretrained/Kronos-Tokenizer-base；缺失则走远端）")
     ap.add_argument("--predictor", default=DEFAULT_PREDICTOR_LOCAL,
@@ -129,7 +134,10 @@ def main() -> None:
                     help="模型源优先级（默认 modelscope，失败自动回退 hf）")
     ap.add_argument("--out", default="")
     ap.add_argument("--report", default="")
-    ap.add_argument("--max-symbols", type=int, default=10)
+    ap.add_argument("--max-symbols", type=int, default=10,
+                    help="要生成特征的标的数（0 或负数=全市场全量）")
+    ap.add_argument("--symbol-offset", type=int, default=0,
+                    help="分批起点偏移；同一 seed 下 0/300/600... 递进不重叠覆盖全市场")
     ap.add_argument("--recent-days", type=int, default=120, help="仅为每只标的最近 N 个交易日生成特征")
     ap.add_argument("--lookback", type=int, default=90)
     ap.add_argument("--pred", type=int, default=5)
@@ -156,7 +164,9 @@ def main() -> None:
     need = args.recent_days + args.lookback + args.pred
     print(f"[step2] 读取最近价量 (validation+test) ...")
     price = _load_recent_price(data_root)
-    symbols = _pick_symbols(price, need=need, n=args.max_symbols, seed=args.seed)
+    symbols = _pick_symbols(price, need=need, n=args.max_symbols, seed=args.seed, offset=args.symbol_offset)
+    if not symbols:
+        raise SystemExit(f"[step2] 未选中任何标的（--symbol-offset {args.symbol_offset} 可能超出合格标的总数）")
     print(f"[step2] 选中 {len(symbols)} 只标的: {symbols}")
 
     print(f"[step2] 加载 Kronos 权重（优先 {args.model_source}）...")

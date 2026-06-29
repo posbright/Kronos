@@ -46,20 +46,37 @@ if _THIS_DIR not in sys.path:
 from build_fusion_dataset import build_fusion, time_split  # noqa: E402
 
 
+def _resolve_parts(fdir: Path, name: str) -> List[Path]:
+    """优先返回单文件 name.csv；不存在则返回拆分的 name.part*.csv（按 symbol 拆分）。"""
+    single = fdir / f"{name}.csv"
+    if single.exists():
+        return [single]
+    parts = sorted(fdir.glob(f"{name}.part*.csv"))
+    return parts
+
+
+def _read_csv_parts(parts: List[Path], symbols: set) -> pd.DataFrame:
+    frames = []
+    for p in parts:
+        df = pd.read_csv(p, dtype={"symbol": str})
+        if symbols:
+            df = df[df["symbol"].isin(symbols)]
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def _load_split_tables(data_root: Path, sources: List[str], symbols: set) -> tuple:
-    """读取并纵向合并多个 split 的 factors.csv / price.csv，按 symbol 过滤去重。"""
+    """读取并纵向合并多个 split 的 factors / price（单文件或 part 分片），按 symbol 过滤去重。"""
     factor_frames, price_frames = [], []
     for s in sources:
         fdir = data_root / s
-        fpath, ppath = fdir / "factors.csv", fdir / "price.csv"
-        if not fpath.exists() or not ppath.exists():
-            print(f"[step3][warn] 跳过缺失 split: {s}（{fpath} / {ppath}）")
+        fparts = _resolve_parts(fdir, "factors")
+        pparts = _resolve_parts(fdir, "price")
+        if not fparts or not pparts:
+            print(f"[step3][warn] 跳过缺失 split: {s}（factors/price 单文件或 part 均未找到 @ {fdir}）")
             continue
-        ff = pd.read_csv(fpath, dtype={"symbol": str})
-        px = pd.read_csv(ppath, dtype={"symbol": str})
-        if symbols:
-            ff = ff[ff["symbol"].isin(symbols)]
-            px = px[px["symbol"].isin(symbols)]
+        ff = _read_csv_parts(fparts, symbols)
+        px = _read_csv_parts(pparts, symbols)
         factor_frames.append(ff)
         price_frames.append(px)
     if not factor_frames:

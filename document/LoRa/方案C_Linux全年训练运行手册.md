@@ -36,9 +36,16 @@ cd Kronos
 
 python3 -m venv .venv
 source .venv/bin/activate
-
+# 查看CUDA的版本
+nvidia-smi
+# 安装命令后添加 -i 参数指定国内镜像源，例如使用清华大学的源：
+pip install sympy -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 阿里云的源：
+pip install sympy -i https://mirrors.aliyun.com/pypi/simple/
+# 失败处理方式
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 # CUDA 版 torch（按服务器 CUDA 版本选 index-url，cu121 示例）
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt   # 已含 lightgbm/pyyaml/einops/tqdm 等全部依赖
 
 python -c "import torch; print('cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
@@ -92,14 +99,14 @@ python finetune_csv/build_dataC_step2_kronos_features.py \
 - **产物**：`DataSet/dataC/kronos_features.csv`（`date,symbol,k_pred_ret,k_up_prob,k_pred_vol`）+ `kronos_features_report.json`（含 `device_resolved`）。
 - 后台长跑：`nohup python finetune_csv/build_dataC_step2_kronos_features.py ... > step2.log 2>&1 &`，或用 `tmux`/`screen`。
 
-上面是 **300 只示例**（先跑通）。**要跑全市场 6000 只**，把 `--max-symbols 300` 改成 `--max-symbols 0` 即可（建议同时用批并行版 + 后台长跑）：
+上面是 **300 只示例**（先跑通）。**要跑全市场 6000 只**，把 `--max-symbols 300` 改成 `--max-symbols 0` 即可（建议同时用批并行版 + 后台长跑）：24 G 显存 512
 
 ```bash
 nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --data-root DataSet/dataC --device cuda:0 \
     --max-symbols 0 --recent-days 250 \
     --lookback 90 --pred 5 --samples 30 --seed 42 \
-    --batch-size 192 --skip-existing > step2_full.log 2>&1 &
+    --batch-size 512 --skip-existing > step2_full.log 2>&1 &
 ```
 
 > 步骤 2 读取 `validation+test`，全年范围已覆盖，**不需改脚本**。8GB 显存够；想压更高吞吐用 4.3 的 `predict_batch` 批并行版（6G 用 `--batch-size 96`、8G 用 192）。
@@ -183,6 +190,7 @@ python finetune_csv/build_dataC_step2_kronos_features_batch.py \
 | --- | --- | --- | --- |
 | 6G | 96 | 128 | OOM 先降到 64；样本/序列长越大越要降 |
 | 8G | 192 | 256 | 8GB 富余，256 仍稳；超过看 `nvidia-smi` |
+| 24G | 512 | 768~1024 | 8核/32G 内存非瓶颈（GPU 限速）；显存到 ~80% 即够，OOM 回退 384 |
 
 相对逐窗版吞吐通常提升 3~8 倍；6G 用 96、8G 用 192 是稳妥默认。
 

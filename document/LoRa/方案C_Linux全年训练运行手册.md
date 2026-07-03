@@ -99,7 +99,8 @@ python finetune_csv/build_dataC_step2_kronos_features.py \
 - `--samples 30` 生产建议 ≥30。
 - `--skip-existing`（默认开）：逐只增量落 `DataSet/dataC/_kronos_parts/`，**中断可续跑**，重跑不丢已完成标的。
 - **产物**：`DataSet/dataC/kronos_features.csv`（`date,symbol,k_pred_ret,k_up_prob,k_pred_vol`）+ `kronos_features_report.json`（含 `device_resolved`）。
-- 后台长跑：`nohup python finetune_csv/build_dataC_step2_kronos_features.py ... > step2.log 2>&1 &`，或用 `tmux`/`screen`。
+- 后台长跑：`nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py ... > step2_full.log 2>&1 &`，或用 `tmux`/`screen`。
+- 日志会实时刷出总进度百分比、单只标的 batch 进度、平均耗时、速度和 ETA；用 `tail -f step2_full.log` 观察即可。
 
 上面是 **300 只示例**（先跑通）。**要跑当前窗口内的全部合格标的**，把 `--max-symbols 300` 改成 `--max-symbols 0` 即可（建议同时用批并行版 + 后台长跑）；这不等于全年历史，只是把当前 dataC 里满足历史长度要求的标的全跑一遍。
 
@@ -108,12 +109,33 @@ nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --data-root DataSet/dataC --device cuda:0 \
     --max-symbols 0 --recent-days 120 \
     --lookback 90 --pred 5 --samples 30 --seed 42 \
-    --batch-size 192 --skip-existing > step2_full.log 2>&1 &
+    --batch-size 512 --symbol-group-size 4 \
+    --skip-existing > step2_full.log 2>&1 &
 ```
 
-> 步骤 2 只读取 `validation+test`。**当前仓库 dataC 不是全年窗**，因此 `--recent-days 250` 会失败；先用 120 跑通，或先重建更长数据后再恢复 250。8GB 显存建议从 `--batch-size 192` 起步；想再提吞吐可视显存上探。
+> 步骤 2 只读取 `validation+test`。**当前仓库 dataC 不是全年窗**，因此 `--recent-days 250` 会失败；先用 120 跑通，或先重建更长数据后再恢复 250。24G A10 建议从 `--batch-size 512 --symbol-group-size 4` 起步；稳定后可试 `--symbol-group-size 8` 或 `--batch-size 768`。8GB 显存仍建议 `--batch-size 192 --symbol-group-size 1`。
 
-### 2.1 为什么默认 300？全市场 6000 只怎么训完
+### 2.1 `lookback` / `pred` 能否增大
+
+可以适量增大，但受当前数据长度硬约束：
+
+```text
+recent-days + lookback + pred <= 每股可用行数
+```
+
+当前 `validation+test` 每股最多约 239 行；默认 `120 + 90 + 5 = 215`，仍有约 24 行余量。比较稳妥的组合如下：
+
+| 目标 | recent-days | lookback | pred | 最少行数 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 默认稳妥 | 120 | 90 | 5 | 215 | 当前推荐；覆盖标的最多，速度和稳定性平衡 |
+| 增大回看 | 120 | 100 | 5 | 225 | 可用；多看历史，预测周期不变 |
+| 小幅增大预测 | 120 | 100 | 10 | 230 | 可用；建议同步把 step3/训练标签改成 10 天 |
+| 更长预测 | 120 | 90 | 20 | 230 | 可用但波动更大；同样要同步 `--horizon 20` 与标签 |
+| 不建议 | 120 | 120 | 20 | 260 | 当前 dataC 会筛不到标的 |
+
+原则：优先小幅提高 `lookback` 到 100 或把 `pred` 提到 10；不要同时大幅提高两者。若 `pred` 从 5 改成 10/20，后续 step3、compare、train、predict 的 `--horizon`/`label_fwd_ret_{H}d` 也要同步改成同一个 H，否则 Kronos 特征预测的是 10/20 天，但下游模型训练的仍是 5 天收益，目标会错位。
+
+### 2.2 为什么默认 300？全市场 6000 只怎么训完
 
 `--max-symbols 300` 只是**示例规模**——300 只单卡在当前 dataC 上按 `recent-days=120` 约十几个小时量级，便于先跑通；如果你重建出更长 dataC，再按 250 天近似放大。覆盖全量两种方式（**先 step2 跑完当前窗口内全部合格标的，step3/5/6 再统一训练一个模型**，并非每批单独训一个）：
 
@@ -122,7 +144,7 @@ nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
 ```bash
 python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --device cuda:0 --max-symbols 0 --recent-days 120 \
-    --samples 30 --batch-size 192 --skip-existing
+    --samples 30 --batch-size 512 --symbol-group-size 4 --skip-existing
 ```
 
 **方式 B：分 300 一批、可多机/多窗口并行** —— 用 `--symbol-offset` 切片，**同一 `--seed` 下批次互不重叠**，跑完拼成一份 `kronos_features.csv`：
@@ -131,7 +153,8 @@ python finetune_csv/build_dataC_step2_kronos_features_batch.py \
 for off in 0 300 600 900 ... 5700; do
   python finetune_csv/build_dataC_step2_kronos_features_batch.py \
       --device cuda:0 --seed 42 --symbol-offset $off --max-symbols 300 \
-            --recent-days 120 --samples 30 --batch-size 192 --skip-existing
+            --recent-days 120 --samples 30 \
+            --batch-size 512 --symbol-group-size 4 --skip-existing
 done
 ```
 
@@ -178,21 +201,22 @@ python finetune_csv/train_c1_bundle.py \
 
 ### 4.3 全市场提速（可选，predict_batch 批并行）
 
-单卡逐窗串行偏慢；用批并行版脚本把「同一标的多窗 × 多采样」打包成一个 batch 一次前向，产物与逐窗版完全一致：
+单卡逐窗串行偏慢；用批并行版脚本把「多窗 × 多采样」打包成一个 batch 一次前向。`--symbol-group-size` 可以进一步把多只标的一起合并进 `predict_batch`，减少单只标的之间的 Python/GPU 空档；只要 `lookback/pred/samples/seed` 不变，产物列和含义不变，仍按 symbol 写回 `_kronos_parts/{symbol}.csv`。
 
 ```bash
 python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --device cuda:0 --max-symbols 300 --recent-days 120 \
-    --lookback 90 --pred 5 --samples 30 --batch-size 192 --skip-existing
+    --lookback 90 --pred 5 --samples 30 \
+    --batch-size 512 --symbol-group-size 4 --skip-existing
 ```
 
-`--batch-size` = 一次进显存的并行序列数（即 窗口×samples）。OOM 就减半，富余就上探。底层走 `KronosPredictor.predict_batch`（[model/kronos.py](../../model/kronos.py)），同批 `lookback`/`pred` 须一致（脚本已保证）。
+`--batch-size` = 一次进显存的并行序列数（即 窗口×samples）；`--symbol-group-size` = 一组同时准备多少只标的。OOM 就优先把 `--symbol-group-size` 减半，再降 `--batch-size`。底层走 `KronosPredictor.predict_batch`（[model/kronos.py](../../model/kronos.py)），同批 `lookback`/`pred` 须一致（脚本已保证）。
 
-| 显存 | 起步 `--batch-size` | 可上探 | 说明 |
+| 显存 | 起步参数 | 可上探 | 说明 |
 | --- | --- | --- | --- |
-| 6G | 96 | 128 | OOM 先降到 64；样本/序列长越大越要降 |
-| 8G | 192 | 256 | 8GB 富余，256 仍稳；超过看 `nvidia-smi` |
-| 24G | 512 | 768~1024 | 8核/32G 内存非瓶颈（GPU 限速）；显存到 ~80% 即够，OOM 回退 384 |
+| 6G | `--batch-size 96 --symbol-group-size 1` | batch 128 | OOM 先降到 64；样本/序列长越大越要降 |
+| 8G | `--batch-size 192 --symbol-group-size 1` | batch 256 | 8GB 不建议跨 symbol 合并，优先稳 |
+| 24G A10 | `--batch-size 512 --symbol-group-size 4` | group 8 / batch 768 | 若显存长期低于 80% 且日志稳定推进，再逐步上探；OOM 回退 group 4 / batch 384 |
 
 相对逐窗版吞吐通常提升 3~8 倍；6G 用 96、8G 用 192 是稳妥默认。
 
@@ -263,7 +287,8 @@ source .venv/bin/activate
 nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --data-root DataSet/dataC --device cuda:0 \
     --max-symbols 0 --recent-days 120 --samples 30 \
-    --batch-size 192 --skip-existing > step2_full.log 2>&1 &
+    --batch-size 512 --symbol-group-size 4 \
+    --skip-existing > step2_full.log 2>&1 &
 wait
 
 # step3/5/6/8：与上面 300 只完全一致，一份特征训一个模型
@@ -280,4 +305,4 @@ python finetune_csv/train_c1_bundle.py --predict \
     --top 10 --out-json runs/dataC_c1/latest_ranking.json
 ```
 
-> 当前 `recent-days=120` 时，全市场单卡 step2 约十几天量级（见 1.4）；若重建更长 dataC 并提回 250 天，约 26 天。建议多机分 `--symbol-offset` 并行（见 2.1 方式 B），或缩小 `--recent-days`/`--samples`。step3/5/6/8 仍是几分钟级 CPU。
+> 当前 `recent-days=120` 时，全市场单卡 step2 约十几天量级（见 1.4）；若重建更长 dataC 并提回 250 天，约 26 天。建议多机分 `--symbol-offset` 并行（见 2.2 方式 B），或缩小 `--recent-days`/`--samples`。step3/5/6/8 仍是几分钟级 CPU。

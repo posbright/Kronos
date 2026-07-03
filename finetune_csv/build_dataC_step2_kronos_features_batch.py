@@ -22,7 +22,8 @@
 用法
     python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --device cuda:0 --max-symbols 300 --recent-days 120 \
-        --lookback 90 --pred 5 --samples 30 --batch-size 192 --skip-existing
+    --lookback 90 --pred 5 --samples 30 \
+    --batch-size 192 --symbol-group-size 1 --skip-existing
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -52,6 +53,18 @@ from kronos_loader import (  # noqa: E402
 )
 
 PRICE_COLS = ["open", "high", "low", "close", "volume", "amount"]
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}min"
+    return f"{seconds / 3600:.2f}h"
 
 
 def _load_recent_price(data_root: Path) -> pd.DataFrame:
@@ -93,14 +106,15 @@ def _resolve_device(device: str) -> str:
             return "mps"
         return "cpu"
     if dev.startswith("cuda") and not torch.cuda.is_available():
-        print(f"[step2-batch][warn] 指定了 {dev} 但当前环境无可用 CUDA，已回退 cpu。")
+        _log(f"[step2-batch][warn] 指定了 {dev} 但当前环境无可用 CUDA，已回退 cpu。")
         return "cpu"
     return dev
 
 
 def _build_symbol_features(predictor, px: pd.DataFrame, symbol: str,
                            lookback: int, pred_len: int, samples: int,
-                           batch_size: int) -> pd.DataFrame:
+                           batch_size: int,
+                           progress_cb: Optional[Callable[[int, int], None]] = None) -> pd.DataFrame:
     """对单只标的逐窗采集 close 预测，用 predict_batch 批并行；返回与逐窗版同列特征。"""
     px = px.sort_values("timestamps").reset_index(drop=True)
     ends = list(range(lookback, len(px) - pred_len + 1))
@@ -126,14 +140,18 @@ def _build_symbol_features(predictor, px: pd.DataFrame, symbol: str,
             df_list.append(x_df); xts_list.append(x_ts); yts_list.append(y_ts); owner.append(wi)
 
     closes_by_win = [[] for _ in jobs]
-    for i in range(0, len(df_list), batch_size):
-        sl = slice(i, i + batch_size)
+    total_batches = (len(df_list) + batch_size - 1) // batch_size
+    progress_every = max(1, total_batches // 10)
+    for batch_index, start in enumerate(range(0, len(df_list), batch_size), start=1):
+        sl = slice(start, start + batch_size)
         preds = predictor.predict_batch(
             df_list[sl], xts_list[sl], yts_list[sl], pred_len=pred_len,
             T=1.0, top_p=0.9, sample_count=1, verbose=False,
         )
         for j, p in enumerate(preds):
-            closes_by_win[owner[i + j]].append(p["close"].values)
+            closes_by_win[owner[start + j]].append(p["close"].values)
+        if progress_cb and (batch_index == total_batches or batch_index % progress_every == 0):
+            progress_cb(batch_index, total_batches)
 
     rows = []
     for wi, (date, last_close) in enumerate(meta):
@@ -146,6 +164,63 @@ def _build_symbol_features(predictor, px: pd.DataFrame, symbol: str,
             "k_pred_vol": float(np.std(end_ret)),
         })
     return pd.DataFrame(rows)
+
+
+def _build_symbol_features_group(predictor, symbol_px: list[tuple[str, pd.DataFrame]],
+                                 lookback: int, pred_len: int, samples: int,
+                                 batch_size: int,
+                                 progress_cb: Optional[Callable[[int, int], None]] = None) -> dict[str, pd.DataFrame]:
+    """跨多只标的合并 predict_batch；输出仍按 symbol 拆回 part，特征含义不变。"""
+    states = {}
+    df_list, xts_list, yts_list, owner = [], [], [], []
+    empty_cols = ["date", "symbol", "k_pred_ret", "k_up_prob", "k_pred_vol"]
+
+    for symbol, px in symbol_px:
+        px = px.sort_values("timestamps").reset_index(drop=True)
+        ends = list(range(lookback, len(px) - pred_len + 1))
+        metas = []
+        closes_by_win = [[] for _ in ends]
+        states[symbol] = {"meta": metas, "closes": closes_by_win}
+        for win_index, end in enumerate(ends):
+            hist = px.iloc[end - lookback:end]
+            x_df = hist[PRICE_COLS].reset_index(drop=True)
+            x_ts = hist["timestamps"].reset_index(drop=True)
+            y_ts = px["timestamps"].iloc[end:end + pred_len].reset_index(drop=True)
+            metas.append((px["timestamps"].iloc[end].normalize(), float(x_df["close"].iloc[-1])))
+            for _ in range(samples):
+                df_list.append(x_df)
+                xts_list.append(x_ts)
+                yts_list.append(y_ts)
+                owner.append((symbol, win_index))
+
+    total_batches = (len(df_list) + batch_size - 1) // batch_size
+    progress_every = max(1, total_batches // 10) if total_batches else 1
+    for batch_index, start in enumerate(range(0, len(df_list), batch_size), start=1):
+        sl = slice(start, start + batch_size)
+        preds = predictor.predict_batch(
+            df_list[sl], xts_list[sl], yts_list[sl], pred_len=pred_len,
+            T=1.0, top_p=0.9, sample_count=1, verbose=False,
+        )
+        for j, p in enumerate(preds):
+            symbol, win_index = owner[start + j]
+            states[symbol]["closes"][win_index].append(p["close"].values)
+        if progress_cb and (batch_index == total_batches or batch_index % progress_every == 0):
+            progress_cb(batch_index, total_batches)
+
+    out = {}
+    for symbol, state in states.items():
+        rows = []
+        for win_index, (date, last_close) in enumerate(state["meta"]):
+            preds = np.asarray(state["closes"][win_index], dtype=np.float64)
+            end_ret = preds[:, -1] / last_close - 1.0
+            rows.append({
+                "date": date, "symbol": symbol,
+                "k_pred_ret": float(end_ret.mean()),
+                "k_up_prob": float((end_ret > 0).mean()),
+                "k_pred_vol": float(np.std(end_ret)),
+            })
+        out[symbol] = pd.DataFrame(rows, columns=empty_cols)
+    return out
 
 
 def main() -> None:
@@ -166,6 +241,8 @@ def main() -> None:
     ap.add_argument("--samples", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=192,
                     help="单次 predict_batch 的并行序列数；6G建议96、8G建议192，OOM则减半")
+    ap.add_argument("--symbol-group-size", type=int, default=1,
+                    help="一次合并多少只标的进入 predict_batch；1=旧行为，24G 可尝试 4/8")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="auto", help="auto / cuda:0 / mps / cpu")
     ap.add_argument("--max-context", type=int, default=512)
@@ -181,44 +258,105 @@ def main() -> None:
     device = _resolve_device(args.device)
     if device == "cpu":
         torch.set_num_threads(os.cpu_count() or 4)
-    print(f"[step2-batch] 运行设备: {device}（请求 --device {args.device}），batch-size={args.batch_size}")
+    if args.batch_size < 1:
+        raise SystemExit("[step2-batch] --batch-size 必须 >= 1")
+    if args.symbol_group_size < 1:
+        raise SystemExit("[step2-batch] --symbol-group-size 必须 >= 1")
+    _log(f"[step2-batch] 运行设备: {device}（请求 --device {args.device}），"
+         f"batch-size={args.batch_size}, symbol-group-size={args.symbol_group_size}")
 
     need = args.recent_days + args.lookback + args.pred
+    _log(f"[step2-batch] 参数: recent-days={args.recent_days}, lookback={args.lookback}, "
+         f"pred={args.pred}, samples={args.samples}, need={need}")
     price = _load_recent_price(data_root)
     symbols = _pick_symbols(price, need=need, n=args.max_symbols, seed=args.seed, offset=args.symbol_offset)
     if not symbols:
         raise SystemExit(f"[step2-batch] 未选中任何标的（--symbol-offset {args.symbol_offset} 可能超出合格标的总数）")
-    print(f"[step2-batch] 选中 {len(symbols)} 只标的")
+    existing_parts = [sym for sym in symbols if (parts_dir / f"{sym}.csv").exists()]
+    pending_count = len(symbols) - len(existing_parts) if args.skip_existing else len(symbols)
+    _log(f"[step2-batch] 选中 {len(symbols)} 只标的；已存在 part {len(existing_parts)} 只；"
+         f"待计算 {pending_count} 只；skip-existing={args.skip_existing}")
 
-    predictor, load_meta = load_kronos_predictor(
-        tokenizer_src=args.tokenizer, predictor_src=args.predictor, device=device,
-        max_context=args.max_context, prefer_source=args.model_source, verbose=True,
-    )
+    predictor, load_meta = None, {}
+    if pending_count > 0:
+        _log(f"[step2-batch] 加载 Kronos 权重（优先 {args.model_source}）...")
+        predictor, load_meta = load_kronos_predictor(
+            tokenizer_src=args.tokenizer, predictor_src=args.predictor, device=device,
+            max_context=args.max_context, prefer_source=args.model_source, verbose=True,
+        )
+    else:
+        _log("[step2-batch] 所有 part 均已存在，跳过模型加载，仅汇总输出。")
 
     price_by_sym = {s: g for s, g in price[price["symbol"].isin(symbols)].groupby("symbol")}
     all_feats, per_symbol = [], []
     t_start = time.time()
-    for i, sym in enumerate(symbols, start=1):
-        part_file = parts_dir / f"{sym}.csv"
-        if args.skip_existing and part_file.exists():
-            feats = pd.read_csv(part_file, dtype={"symbol": str})
-            feats["date"] = pd.to_datetime(feats["date"])
-            all_feats.append(feats)
-            per_symbol.append({"symbol": sym, "rows": int(len(feats)), "seconds": 0.0, "resumed": True})
-            print(f"[step2-batch] ({i}/{len(symbols)}) {sym}: 复用 part {len(feats)} 行")
+    computed_symbols = 0
+    computed_seconds = 0.0
+    for group_start in range(0, len(symbols), args.symbol_group_size):
+        group_symbols = symbols[group_start:group_start + args.symbol_group_size]
+        pending_symbols = []
+        for offset, sym in enumerate(group_symbols, start=1):
+            i = group_start + offset
+            part_file = parts_dir / f"{sym}.csv"
+            pct = i / len(symbols) * 100.0
+            if args.skip_existing and part_file.exists():
+                feats = pd.read_csv(part_file, dtype={"symbol": str})
+                feats["date"] = pd.to_datetime(feats["date"])
+                all_feats.append(feats)
+                per_symbol.append({"symbol": sym, "rows": int(len(feats)), "seconds": 0.0, "resumed": True})
+                _log(f"[step2-batch] 总进度 {i}/{len(symbols)} ({pct:.2f}%) | {sym}: "
+                     f"复用 part {len(feats)} 行")
+            else:
+                pending_symbols.append((i, sym))
+        if not pending_symbols:
             continue
-        g = price_by_sym[sym].tail(need).rename(columns={"date": "timestamps"})
-        px = g[["timestamps"] + PRICE_COLS].copy()
-        t_sym = time.time()
-        feats = _build_symbol_features(predictor, px, sym, args.lookback, args.pred,
-                                       args.samples, args.batch_size)
-        dt = time.time() - t_sym
-        feats.to_csv(part_file, index=False)
-        all_feats.append(feats)
-        per_symbol.append({"symbol": sym, "rows": int(len(feats)), "seconds": round(dt, 1), "resumed": False})
-        done = time.time() - t_start
-        eta = done / i * (len(symbols) - i)
-        print(f"[step2-batch] ({i}/{len(symbols)}) {sym}: {len(feats)} 行, {dt:.1f}s | ETA {eta/60:.1f}min")
+
+        group_label = f"{pending_symbols[0][1]}..{pending_symbols[-1][1]}"
+        group_pct = pending_symbols[-1][0] / len(symbols) * 100.0
+        px_items = []
+        for _, sym in pending_symbols:
+            g = price_by_sym[sym].tail(need).rename(columns={"date": "timestamps"})
+            px_items.append((sym, g[["timestamps"] + PRICE_COLS].copy()))
+        t_group = time.time()
+
+        def _group_progress(batch_index: int, total_batches: int) -> None:
+            batch_pct = batch_index / total_batches * 100.0
+            _log(f"[step2-batch] 总进度 {pending_symbols[-1][0]}/{len(symbols)} ({group_pct:.2f}%) | "
+                 f"group {group_label}: batch {batch_index}/{total_batches} ({batch_pct:.1f}%)")
+
+        if args.symbol_group_size == 1:
+            _, sym = pending_symbols[0]
+            feats = _build_symbol_features(predictor, px_items[0][1], sym, args.lookback, args.pred,
+                                           args.samples, args.batch_size, progress_cb=_group_progress)
+            feats_by_symbol = {sym: feats}
+        else:
+            feats_by_symbol = _build_symbol_features_group(
+                predictor, px_items, args.lookback, args.pred, args.samples,
+                args.batch_size, progress_cb=_group_progress,
+            )
+        group_dt = time.time() - t_group
+        seconds_per_symbol = group_dt / len(pending_symbols)
+
+        for _, sym in pending_symbols:
+            feats = feats_by_symbol[sym]
+            part_file = parts_dir / f"{sym}.csv"
+            feats.to_csv(part_file, index=False)
+            all_feats.append(feats)
+            per_symbol.append({"symbol": sym, "rows": int(len(feats)), "seconds": round(seconds_per_symbol, 1), "resumed": False})
+            computed_symbols += 1
+            computed_seconds += seconds_per_symbol
+
+        pending_left = sum(1 for rest_sym in symbols[pending_symbols[-1][0]:]
+                           if not (parts_dir / f"{rest_sym}.csv").exists())
+        avg_seconds = computed_seconds / max(1, computed_symbols)
+        eta = avg_seconds * pending_left
+        elapsed = time.time() - t_start
+        speed = computed_symbols / max(elapsed, 1e-9) * 3600.0
+        row_count = sum(len(feats_by_symbol[sym]) for _, sym in pending_symbols)
+        _log(f"[step2-batch] 总进度 {pending_symbols[-1][0]}/{len(symbols)} ({group_pct:.2f}%) | "
+             f"group {group_label}: 完成 {len(pending_symbols)}只/{row_count}行，"
+             f"用时 {_fmt_duration(group_dt)}，均值 {_fmt_duration(avg_seconds)}/只，"
+             f"速度 {speed:.2f}只/h，剩余待算 {pending_left}只，ETA {_fmt_duration(eta)}")
 
     feats_all = pd.concat(all_feats, ignore_index=True).sort_values(["date", "symbol"]).reset_index(drop=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,7 +368,8 @@ def main() -> None:
         "params": {
             "max_symbols": args.max_symbols, "recent_days": args.recent_days,
             "lookback": args.lookback, "pred": args.pred, "samples": args.samples,
-            "batch_size": args.batch_size, "seed": args.seed,
+            "batch_size": args.batch_size, "symbol_group_size": args.symbol_group_size,
+            "seed": args.seed,
             "device": args.device, "device_resolved": device, "model_source": args.model_source,
         },
         "loaded": load_meta, "symbols": symbols, "per_symbol": per_symbol,
@@ -238,7 +377,7 @@ def main() -> None:
         "elapsed_seconds": round(time.time() - t_start, 1), "out_file": str(out_path),
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[step2-batch] 完成：{len(feats_all)} 行 -> {out_path}；总耗时 {(time.time()-t_start)/60:.1f}min")
+    _log(f"[step2-batch] 完成：{len(feats_all)} 行 -> {out_path}；总耗时 {_fmt_duration(time.time()-t_start)}")
 
 
 if __name__ == "__main__":

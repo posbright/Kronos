@@ -115,7 +115,64 @@ nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
 
 > 步骤 2 只读取 `validation+test`。**当前仓库 dataC 不是全年窗**，因此 `--recent-days 250` 会失败；先用 120 跑通，或先重建更长数据后再恢复 250。24G A10 建议从 `--batch-size 512 --symbol-group-size 4` 起步；稳定后可试 `--symbol-group-size 8` 或 `--batch-size 768`。8GB 显存仍建议 `--batch-size 192 --symbol-group-size 1`。
 
-### 2.1 `lookback` / `pred` 能否增大
+### 2.1 24G A10 上的优化版完整脚本（直接复制）
+
+适用于你当前的 NVIDIA A10 24G。该脚本只加速 step2 的 Kronos 特征生成，不改变最终特征含义；已有 `_kronos_parts/*.csv` 会被 `--skip-existing` 自动复用。
+
+```bash
+cd /mnt/workspace/Kronos_back/Kronos
+source .venv/bin/activate
+
+# 1) 如果之前旧版 step2 还在跑，先停掉；没有进程则跳过。
+ps -ef | grep -E "build_dataC_step2|python" | grep -v grep
+# kill <旧step2进程PID>
+
+# 2) 拉取包含 --symbol-group-size 的新版代码。
+git pull
+
+# 3) 启动 24G A10 优化版 step2。
+nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
+    --data-root DataSet/dataC --device cuda:0 \
+    --max-symbols 0 --recent-days 120 \
+    --lookback 90 --pred 5 --samples 30 --seed 42 \
+    --batch-size 512 --symbol-group-size 4 \
+    --skip-existing > step2_full.log 2>&1 &
+
+# 4) 观察进度、显存和最近速度。
+tail -f step2_full.log
+```
+
+另开一个终端可随时查看进度和 ETA：
+
+```bash
+done=$(ls DataSet/dataC/_kronos_parts/*.csv 2>/dev/null | wc -l)
+recent30=$(find DataSet/dataC/_kronos_parts -name "*.csv" -mmin -30 | wc -l)
+echo "done=$done, remain=$((5723-done)), recent30=$recent30, rate_per_hour=$((recent30*2))"
+nvidia-smi
+```
+
+若 `step2_full.log` 稳定推进、显存低于 80%，可下次尝试 `--symbol-group-size 8` 或 `--batch-size 768`。若 OOM，优先回退到 `--symbol-group-size 4`，再把 `--batch-size` 降到 384。
+
+step2 完成后再执行后续 CPU 步骤：
+
+```bash
+python finetune_csv/build_dataC_step3_fusion.py \
+    --data-root DataSet/dataC --horizon 5 --train-end 2026-04-01 --val-end 2026-05-15
+
+python finetune_csv/compare_fusion_strategies.py \
+    --train DataSet/dataC/fusion_train.csv --val DataSet/dataC/fusion_val.csv \
+    --test DataSet/dataC/fusion_test.csv --label label_fwd_ret_5d \
+    --out-json DataSet/dataC/fusion_selection.json
+
+python finetune_csv/train_c1_bundle.py \
+    --data-root DataSet/dataC --out-bundle runs/dataC_c1 --horizon 5
+
+python finetune_csv/train_c1_bundle.py --predict \
+    --data-root DataSet/dataC --out-bundle runs/dataC_c1 \
+    --top 10 --out-json runs/dataC_c1/latest_ranking.json
+```
+
+### 2.2 `lookback` / `pred` 能否增大
 
 可以适量增大，但受当前数据长度硬约束：
 
@@ -135,7 +192,7 @@ recent-days + lookback + pred <= 每股可用行数
 
 原则：优先小幅提高 `lookback` 到 100 或把 `pred` 提到 10；不要同时大幅提高两者。若 `pred` 从 5 改成 10/20，后续 step3、compare、train、predict 的 `--horizon`/`label_fwd_ret_{H}d` 也要同步改成同一个 H，否则 Kronos 特征预测的是 10/20 天，但下游模型训练的仍是 5 天收益，目标会错位。
 
-### 2.2 为什么默认 300？全市场 6000 只怎么训完
+### 2.3 为什么默认 300？全市场 6000 只怎么训完
 
 `--max-symbols 300` 只是**示例规模**——300 只单卡在当前 dataC 上按 `recent-days=120` 约十几个小时量级，便于先跑通；如果你重建出更长 dataC，再按 250 天近似放大。覆盖全量两种方式（**先 step2 跑完当前窗口内全部合格标的，step3/5/6 再统一训练一个模型**，并非每批单独训一个）：
 
@@ -305,4 +362,4 @@ python finetune_csv/train_c1_bundle.py --predict \
     --top 10 --out-json runs/dataC_c1/latest_ranking.json
 ```
 
-> 当前 `recent-days=120` 时，全市场单卡 step2 约十几天量级（见 1.4）；若重建更长 dataC 并提回 250 天，约 26 天。建议多机分 `--symbol-offset` 并行（见 2.2 方式 B），或缩小 `--recent-days`/`--samples`。step3/5/6/8 仍是几分钟级 CPU。
+> 当前 `recent-days=120` 时，全市场单卡 step2 约十几天量级（见 1.4）；若重建更长 dataC 并提回 250 天，约 26 天。建议多机分 `--symbol-offset` 并行（见 2.3 方式 B），或缩小 `--recent-days`/`--samples`。step3/5/6/8 仍是几分钟级 CPU。

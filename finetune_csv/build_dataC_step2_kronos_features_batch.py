@@ -21,7 +21,7 @@
 
 用法
     python finetune_csv/build_dataC_step2_kronos_features_batch.py \
-        --device cuda:0 --max-symbols 300 --recent-days 250 \
+    --device cuda:0 --max-symbols 300 --recent-days 120 \
         --lookback 90 --pred 5 --samples 30 --batch-size 192 --skip-existing
 """
 

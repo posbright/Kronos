@@ -366,9 +366,10 @@ python finetune_csv/build_fusion_dataset.py \
 1. **先重跑 step2 生成全年 kronos 特征（GPU）**——这是耗时大头：
    ```bash
    python finetune_csv/build_dataC_step2_kronos_features.py \
-       --device cuda:0 --max-symbols 300 --recent-days 250 --samples 30
+       --device cuda:0 --max-symbols 300 --recent-days 120 --samples 30
    ```
-   - `--recent-days 250` ≈ 一个完整交易年；`--samples` 越大特征越稳（生产建议 ≥30）。
+   - **当前仓库 dataC** 的 `validation+test` 每股最多约 239 行，所以这里先用 `--recent-days 120` 跑通；如果你先按第 2 步重建出更长的 validation/test，再把它提回 250。
+   - `--samples` 越大特征越稳（生产建议 ≥30）。
    - 断点续跑：`_kronos_parts/` + `--skip-existing` 默认开，中断不丢已完成标的。
    - **全市场**：`--max-symbols 0` 一次跑全 6000 只；或分批用 `--symbol-offset 0/300/600...`（同 seed 不重叠），汇总为同一份特征后统一训一个模型。
    - GPU 提速量级见第 3.2 节；全市场全历史建议改用 `KronosPredictor.predict_batch` 多标的并行。
@@ -676,7 +677,7 @@ python -c "import torch; print('cuda', torch.cuda.is_available(), torch.cuda.get
 
 ```bash
 python finetune_csv/build_dataC_step2_kronos_features.py \
-    --device cuda:0 --max-symbols 300 --recent-days 250 --samples 30 --skip-existing
+    --device cuda:0 --max-symbols 300 --recent-days 120 --samples 30 --skip-existing
 ```
 
 - `--device cuda:0`：显式 GPU；无 CUDA 会自动回退 CPU 并告警（见 3.2）。
@@ -768,7 +769,7 @@ source .venv/bin/activate
 # 步骤2：GPU 生成 Kronos 特征（CPU 机去掉 --device 或用 --device cpu）
 .venv/bin/python finetune_csv/build_dataC_step2_kronos_features.py \
     --data-root ./DataSet/dataC --device cuda:0 \
-    --max-symbols 300 --recent-days 250 --samples 30 --skip-existing
+    --max-symbols 300 --recent-days 120 --samples 30 --skip-existing
 
 # 步骤3：融合 + 切分
 .venv/bin/python finetune_csv/build_dataC_step3_fusion.py \
@@ -822,7 +823,7 @@ python finetune_csv/build_dataC_step1_from_quantia.py `
 # 步骤2：生成 Kronos 特征（有 GPU 用 --device cuda:0，无则去掉或 --device cpu）
 python finetune_csv/build_dataC_step2_kronos_features.py `
     --data-root DataSet/dataC --device cuda:0 `
-    --max-symbols 300 --recent-days 250 --samples 30 --skip-existing
+    --max-symbols 300 --recent-days 120 --samples 30 --skip-existing
 
 # 步骤3：融合 + 切分
 python finetune_csv/build_dataC_step3_fusion.py `

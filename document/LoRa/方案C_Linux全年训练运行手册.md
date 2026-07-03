@@ -7,7 +7,7 @@
 > 关键结论先说：
 > - **唯一吃 GPU 的是步骤 2**（Kronos 衍生特征，逐窗自回归采样）；**步骤 3 融合、步骤 5 选型、步骤 6 训练、步骤 8 预测全是纯 CPU**。
 > - Kronos-base/small 权重仅数百 MB，**8GB 显存绰绰有余**；显存不是瓶颈，吞吐量才是。
-> - 步骤 2 读取 `validation + test` 两段价量（默认各 180 天，合计 ≈ 360 个交易日 ≈ **一个完整交易年**），所以"全年"无需改脚本。
+> - **当前仓库里的 `DataSet/dataC` 不是 180+180 的全年窗**：`validation+test` 每股最多约 239 行，因此 step2 里 `--recent-days 250` 会报历史长度不足；按当前数据应改用 `--recent-days 120` 左右（`lookback=90,pred=5` 时上限约为 144）。若你先用 step1 重新生成更长的 `dataC`，再把 `--recent-days` 提回 250。
 
 ---
 
@@ -18,11 +18,11 @@
 | 系统 | Linux（Ubuntu/CentOS 等） |
 | GPU | NVIDIA，显存 ≥ 8GB；`nvidia-smi` 正常 |
 | 显存占用 | Kronos-base ≈ 几百 MB，8GB 富余 |
-| 全年范围 | 由 `validation(180d)+test(180d)` 提供，约 360 交易日 |
+| 当前 dataC | `validation+test` 每股最多约 239 行；step2 建议 `--recent-days 120`，`lookback=90,pred=5` 时上限约 144 |
 | 全量训练 | C1 下游模型（LightGBM/Ridge）**纯 CPU**，无需 GPU |
 
-> **"全量"含义**：本手册指**全年 + 尽量多标的**。Kronos 逐窗串行推理，**全市场全年单卡仍偏慢**（见 1.4 时长估算），
-> 建议先用数百只标的跑通全年；要全市场需多卡或改 `predict_batch` 批并行（见 4.3）。
+> **"全量"含义**：本手册指**尽量多标的 + 尽量长的可用窗口**。在当前仓库 `dataC` 上，`validation+test` 只能支撑最近窗口推理，
+> 建议先用数百只标的跑通 `--recent-days 120`；若你重新构建了更长的 `dataC`，再把 `recent-days` 提回 250。要全市场需多卡或改 `predict_batch` 批并行（见 4.3）。
 
 ---
 
@@ -68,15 +68,16 @@ rsync -avz user@srchost:/path/Kronos/DataSet/dataC/ ./DataSet/dataC/
 
 默认 **ModelScope 优先、HF 兜底**（`AI-ModelScope/*` → `NeoQuasar/*`）。离线机预置 `~/.cache/modelscope`、`~/.cache/huggingface`，或本地权重目录传 `--tokenizer/--predictor`。
 
-### 1.4 全年耗时估算（8GB 单卡）
+### 1.4 当前数据下的耗时估算（8GB 单卡）
 
 成本 = 标的数 × 窗口数 × samples × 单次耗时；GPU 单次 ≈ 0.05s。窗口数 ≈ `recent-days+1`。
+当前仓库 `dataC` 的 `validation+test` 最多只够 `recent-days≈120` 级别的演示窗口；下表按这个更稳妥的档位估算。若你重新生成了更长数据，再按 250 天近似线性放大。
 
 | 规模 | 标的 | recent-days | samples | 估算 |
 | --- | --- | --- | --- | --- |
-| 验证 | 50 | 250 | 30 | ≈ 5 h |
-| 推荐 | 300 | 250 | 30 | ≈ 31 h |
-| 全市场 | 6000 | 250 | 30 | ≈ 26 天（需 `predict_batch`/多卡；`--max-symbols 0` 一次全量） |
+| 验证 | 50 | 120 | 30 | ≈ 2.4 h |
+| 推荐 | 300 | 120 | 30 | ≈ 14.9 h |
+| 全市场（仅在重建更长 dataC 后） | 6000 | 250 | 30 | ≈ 26 天（需 `predict_batch`/多卡；`--max-symbols 0` 一次全量） |
 
 ---
 
@@ -88,38 +89,39 @@ source .venv/bin/activate
 python finetune_csv/build_dataC_step2_kronos_features.py \
     --data-root DataSet/dataC \
     --device cuda:0 \
-    --max-symbols 300 --recent-days 250 \
+    --max-symbols 300 --recent-days 120 \
     --lookback 90 --pred 5 --samples 30 --seed 42 \
     --skip-existing
 ```
 
 - `--device cuda:0`：显式 GPU；无 CUDA 自动回退 CPU 并告警。
-- `--recent-days 250` ≈ 一个交易年；`--samples 30` 生产建议 ≥30。
+- `--recent-days 120` 适配当前仓库 `dataC`；如果你先按 step1 重建出更长的 `validation/test`，再把它提回 250。
+- `--samples 30` 生产建议 ≥30。
 - `--skip-existing`（默认开）：逐只增量落 `DataSet/dataC/_kronos_parts/`，**中断可续跑**，重跑不丢已完成标的。
 - **产物**：`DataSet/dataC/kronos_features.csv`（`date,symbol,k_pred_ret,k_up_prob,k_pred_vol`）+ `kronos_features_report.json`（含 `device_resolved`）。
 - 后台长跑：`nohup python finetune_csv/build_dataC_step2_kronos_features.py ... > step2.log 2>&1 &`，或用 `tmux`/`screen`。
 
-上面是 **300 只示例**（先跑通）。**要跑全市场 6000 只**，把 `--max-symbols 300` 改成 `--max-symbols 0` 即可（建议同时用批并行版 + 后台长跑）：24 G 显存 512
+上面是 **300 只示例**（先跑通）。**要跑当前窗口内的全部合格标的**，把 `--max-symbols 300` 改成 `--max-symbols 0` 即可（建议同时用批并行版 + 后台长跑）；这不等于全年历史，只是把当前 dataC 里满足历史长度要求的标的全跑一遍。
 
 ```bash
 nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --data-root DataSet/dataC --device cuda:0 \
-    --max-symbols 0 --recent-days 250 \
+    --max-symbols 0 --recent-days 120 \
     --lookback 90 --pred 5 --samples 30 --seed 42 \
-    --batch-size 512 --skip-existing > step2_full.log 2>&1 &
+    --batch-size 192 --skip-existing > step2_full.log 2>&1 &
 ```
 
-> 步骤 2 读取 `validation+test`，全年范围已覆盖，**不需改脚本**。8GB 显存够；想压更高吞吐用 4.3 的 `predict_batch` 批并行版（6G 用 `--batch-size 96`、8G 用 192）。
+> 步骤 2 只读取 `validation+test`。**当前仓库 dataC 不是全年窗**，因此 `--recent-days 250` 会失败；先用 120 跑通，或先重建更长数据后再恢复 250。8GB 显存建议从 `--batch-size 192` 起步；想再提吞吐可视显存上探。
 
 ### 2.1 为什么默认 300？全市场 6000 只怎么训完
 
-`--max-symbols 300` 只是**示例规模**——300 只单卡约 31h（见 1.4），便于先跑通；全市场 ≈6000 只单卡逐窗要 ~26 天。覆盖全市场两种方式（**先 step2 跑全 6000 只特征，step3/5/6 再统一训练一个模型**，并非每批单独训一个）：
+`--max-symbols 300` 只是**示例规模**——300 只单卡在当前 dataC 上按 `recent-days=120` 约十几个小时量级，便于先跑通；如果你重建出更长 dataC，再按 250 天近似放大。覆盖全量两种方式（**先 step2 跑完当前窗口内全部合格标的，step3/5/6 再统一训练一个模型**，并非每批单独训一个）：
 
-**方式 A：一次全量（推荐，最省心）** —— `--max-symbols 0` 即全市场，`--skip-existing` 逐只落 part，**中断随时续跑**：
+**方式 A：一次全量（推荐，最省心）** —— `--max-symbols 0` 即“当前窗口内全部合格标的”，`--skip-existing` 逐只落 part，**中断随时续跑**：
 
 ```bash
 python finetune_csv/build_dataC_step2_kronos_features_batch.py \
-    --device cuda:0 --max-symbols 0 --recent-days 250 \
+    --device cuda:0 --max-symbols 0 --recent-days 120 \
     --samples 30 --batch-size 192 --skip-existing
 ```
 
@@ -129,11 +131,11 @@ python finetune_csv/build_dataC_step2_kronos_features_batch.py \
 for off in 0 300 600 900 ... 5700; do
   python finetune_csv/build_dataC_step2_kronos_features_batch.py \
       --device cuda:0 --seed 42 --symbol-offset $off --max-symbols 300 \
-      --recent-days 250 --samples 30 --batch-size 192 --skip-existing
+            --recent-days 120 --samples 30 --batch-size 192 --skip-existing
 done
 ```
 
-> 关键：**6000 只共用一个 step2 输出 + 一个 step3/6 模型**，不是 6000/300=20 个模型。part 写在 `_kronos_parts/{symbol}.csv`，无论分多少批，最后 step2 都汇总成同一张 `kronos_features.csv` 供后续步骤一次性训练。多机时各机跑不同 offset，汇总 part 目录即可。
+> 关键：**当前仓库 dataC 共用一个 step2 输出 + 一个 step3/6 模型**，不是每批单独训一个。part 写在 `_kronos_parts/{symbol}.csv`，无论分多少批，最后 step2 都汇总成同一张 `kronos_features.csv` 供后续步骤一次性训练。多机时各机跑不同 offset，汇总 part 目录即可。
 
 ---
 
@@ -180,7 +182,7 @@ python finetune_csv/train_c1_bundle.py \
 
 ```bash
 python finetune_csv/build_dataC_step2_kronos_features_batch.py \
-    --device cuda:0 --max-symbols 300 --recent-days 250 \
+    --device cuda:0 --max-symbols 300 --recent-days 120 \
     --lookback 90 --pred 5 --samples 30 --batch-size 192 --skip-existing
 ```
 
@@ -234,7 +236,7 @@ source .venv/bin/activate
 
 python finetune_csv/build_dataC_step2_kronos_features.py \
     --data-root DataSet/dataC --device cuda:0 \
-    --max-symbols 300 --recent-days 250 --samples 30 --skip-existing
+    --max-symbols 300 --recent-days 120 --samples 30 --skip-existing
 
 python finetune_csv/build_dataC_step3_fusion.py \
     --data-root DataSet/dataC --horizon 5 --train-end 2026-04-01 --val-end 2026-05-15
@@ -260,7 +262,7 @@ source .venv/bin/activate
 # step2：全市场 6000 只全量（批并行 + 后台续跑）
 nohup python finetune_csv/build_dataC_step2_kronos_features_batch.py \
     --data-root DataSet/dataC --device cuda:0 \
-    --max-symbols 0 --recent-days 250 --samples 30 \
+    --max-symbols 0 --recent-days 120 --samples 30 \
     --batch-size 192 --skip-existing > step2_full.log 2>&1 &
 wait
 
@@ -278,4 +280,4 @@ python finetune_csv/train_c1_bundle.py --predict \
     --top 10 --out-json runs/dataC_c1/latest_ranking.json
 ```
 
-> 全市场单卡 step2 ~26 天（见 1.4）：建议多机分 `--symbol-offset` 并行（见 2.1 方式 B），或缩小 `--recent-days`/`--samples`。step3/5/6/8 仍是几分钟级 CPU。
+> 当前 `recent-days=120` 时，全市场单卡 step2 约十几天量级（见 1.4）；若重建更长 dataC 并提回 250 天，约 26 天。建议多机分 `--symbol-offset` 并行（见 2.1 方式 B），或缩小 `--recent-days`/`--samples`。step3/5/6/8 仍是几分钟级 CPU。

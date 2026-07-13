@@ -69,12 +69,16 @@ class LocalKpredServiceTest(unittest.TestCase):
             engine = LocalKpredEngine(_FakePredictor(), config=config)
 
         self.assertEqual(engine.lookback, 256)
-        self.assertEqual(engine.max_pred_days, 10)
+        self.assertEqual(engine.max_pred_days, 30)
+        self.assertEqual(engine.evaluation_horizons, (1, 3, 5, 10, 15, 30))
         self.assertEqual(engine.top_k, 1)
         self.assertEqual(engine.top_p, 1.0)
 
     def test_engine_sanitizes_predictions_and_keeps_c1_optional(self):
-        with mock.patch.dict(os.environ, {"KRONOS_C1_ENABLED": "0"}, clear=False):
+        with mock.patch.dict(os.environ, {
+            "KRONOS_C1_ENABLED": "0",
+            "KRONOS_LOOKBACK": "",
+        }, clear=False):
             result = LocalKpredEngine(
                 _FakePredictor(), config={"inference": {"lookback": 90}}
             ).predict(_payload())
@@ -86,6 +90,30 @@ class LocalKpredServiceTest(unittest.TestCase):
             self.assertGreaterEqual(item["high"], max(item["open"], item["close"]))
             self.assertLessEqual(item["low"], min(item["open"], item["close"]))
             self.assertGreaterEqual(item["volume"], 0)
+
+    def test_engine_rejects_horizon_outside_evaluation_options(self):
+        with mock.patch.dict(os.environ, {
+            "KRONOS_C1_ENABLED": "0",
+            "KRONOS_LOOKBACK": "",
+        }, clear=False):
+            engine = LocalKpredEngine(
+                _FakePredictor(), config={"inference": {"lookback": 90}}
+            )
+
+        with self.assertRaisesRegex(ValueError, "days must be one of"):
+            engine.predict(_payload(days=2))
+
+    def test_evaluation_horizons_support_environment_override(self):
+        with mock.patch.dict(os.environ, {
+            "KRONOS_C1_ENABLED": "0",
+            "KRONOS_LOOKBACK": "",
+            "KRONOS_EVALUATION_HORIZONS": "1,5,30",
+        }, clear=False):
+            engine = LocalKpredEngine(
+                _FakePredictor(), config={"inference": {"lookback": 90}}
+            )
+
+        self.assertEqual(engine.evaluation_horizons, (1, 5, 30))
 
     def test_c1_negative_ic_bundle_is_blocked_by_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:

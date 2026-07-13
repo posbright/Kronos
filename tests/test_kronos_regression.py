@@ -87,7 +87,7 @@ def test_kronos_predictor_regression(context_len):
 
     np.testing.assert_allclose(obtained, expected, rtol=REL_TOLERANCE)
 
-@pytest.mark.parametrize("context_len, expected_mse", zip(MSE_CTX_LEN, MSE_EXPECTED))
+@pytest.mark.parametrize("context_len, expected_mse", list(zip(MSE_CTX_LEN, MSE_EXPECTED)))
 def test_kronos_predictor_mse(context_len, expected_mse):
     set_seed(SEED)
 

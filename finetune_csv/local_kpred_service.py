@@ -87,6 +87,27 @@ def _bool_setting(config: dict[str, Any], section: str, key: str,
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _horizon_setting(config: dict[str, Any], max_pred_days: int) -> tuple[int, ...]:
+    value: Any = os.environ.get("KRONOS_EVALUATION_HORIZONS")
+    if value is None or value.strip() == "":
+        value = config.get("inference", {}).get(
+            "evaluation_horizons", [1, 3, 5, 10, 15, 30]
+        )
+    if isinstance(value, str):
+        value = [item.strip() for item in value.split(",") if item.strip()]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("evaluation_horizons must be a list or comma-separated string")
+    try:
+        horizons = tuple(sorted({int(item) for item in value}))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("evaluation_horizons must contain integers") from exc
+    if not horizons or horizons[0] < 1 or horizons[-1] > max_pred_days:
+        raise ValueError(
+            f"evaluation_horizons must be within 1..{max_pred_days} and cannot be empty"
+        )
+    return horizons
+
+
 def _finite_float(value: Any, field: str) -> float:
     try:
         number = float(value)
@@ -290,8 +311,9 @@ class LocalKpredEngine:
             self.config, "inference", "lookback", "KRONOS_LOOKBACK", 256, int
         )))
         self.max_pred_days = max(1, min(120, _setting(
-            self.config, "inference", "max_pred_days", "KRONOS_MAX_PRED_DAYS", 10, int
+            self.config, "inference", "max_pred_days", "KRONOS_MAX_PRED_DAYS", 30, int
         )))
+        self.evaluation_horizons = _horizon_setting(self.config, self.max_pred_days)
         self.sample_count = max(1, min(64, _setting(
             self.config, "inference", "sample_count", "KRONOS_SAMPLE_COUNT", 1, int
         )))
@@ -341,6 +363,7 @@ class LocalKpredEngine:
             "max_context": self.max_context,
             "lookback": self.lookback,
             "max_pred_days": self.max_pred_days,
+            "evaluation_horizons": list(self.evaluation_horizons),
             "sample_count": self.sample_count,
             "temperature": self.temperature,
             "top_k": self.top_k,
@@ -353,9 +376,11 @@ class LocalKpredEngine:
         started = time.perf_counter()
         symbol = str(payload.get("code") or payload.get("symbol") or "").strip()
         days = int(payload.get("days", 5))
-        if len(symbol) != 6 or not symbol.isdigit() or not 1 <= days <= self.max_pred_days:
+        if len(symbol) != 6 or not symbol.isdigit():
+            raise ValueError("code must be six digits")
+        if days not in self.evaluation_horizons:
             raise ValueError(
-                f"code must be six digits and days must be 1..{self.max_pred_days}"
+                f"days must be one of {list(self.evaluation_horizons)}"
             )
         history = _history_frame(payload.get("history"), self.lookback)
         last_date = pd.Timestamp(history["date"].iloc[-1])
@@ -389,6 +414,9 @@ class LocalKpredEngine:
             "model_version": f"kronos:{Path(str(source)).name}",
             "history_last_date": str(last_date.date()),
             "prediction_start_date": predictions[0]["date"],
+            "evaluation_horizons": [
+                horizon for horizon in self.evaluation_horizons if horizon <= days
+            ],
             "stale": bool(payload.get("history_stale", False)),
             "c1": c1_status,
             "latencyMs": round((time.perf_counter() - started) * 1000),

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import pandas as pd
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "finetune_csv"))
@@ -31,6 +32,11 @@ class _FakePredictor:
              "volume": -1, "amount": 100.0}
             for _ in range(pred_len)
         ], index=future_dates)
+
+
+class _ModeModule(torch.nn.Module):
+    def forward(self, value):
+        return value
 
 
 class _BlockingPredictor(_FakePredictor):
@@ -60,6 +66,19 @@ def _payload(days=3):
 
 
 class LocalKpredServiceTest(unittest.TestCase):
+    def test_kronos_predictor_switches_modules_to_eval_mode(self):
+        from model.kronos import KronosPredictor
+
+        model = _ModeModule()
+        tokenizer = _ModeModule()
+        self.assertTrue(model.training)
+        self.assertTrue(tokenizer.training)
+
+        predictor = KronosPredictor(model, tokenizer, device="cpu")
+
+        self.assertFalse(predictor.model.training)
+        self.assertFalse(predictor.tokenizer.training)
+
     def test_yaml_config_controls_inference_limits(self):
         config = _load_config(ROOT / "finetune_csv" / "configs" / "local_kpred.yaml")
         config["model"]["max_context"] = 128

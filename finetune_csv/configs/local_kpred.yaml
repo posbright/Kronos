@@ -1,6 +1,8 @@
 service:
   host: 127.0.0.1
   port: 18081
+  max_concurrency: 1
+  queue_timeout: 5
 
 model:
   # 相对路径统一以 Kronos 仓库根目录解析，Windows/Linux 均可直接使用。

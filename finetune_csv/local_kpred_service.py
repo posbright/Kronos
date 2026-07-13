@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -13,16 +14,18 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import yaml
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+for module_path in (_SCRIPT_DIR, _REPO_ROOT):
+    if str(module_path) not in sys.path:
+        sys.path.insert(0, str(module_path))
 
 from kronos_loader import (
     DEFAULT_PREDICTOR_LOCAL,
@@ -34,6 +37,10 @@ _DEFAULT_BUNDLE = _REPO_ROOT / "runs" / "dataC_c1"
 _DEFAULT_FEATURES = _REPO_ROOT / "DataSet" / "dataC" / "fusion_all.csv"
 _DEFAULT_CONFIG = _REPO_ROOT / "finetune_csv" / "configs" / "local_kpred.yaml"
 _REQUIRED_PRICE_COLS = ["open", "high", "low", "close"]
+
+
+class InferenceBusyError(RuntimeError):
+    """Raised when the bounded inference queue cannot accept another request."""
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -118,6 +125,26 @@ def _finite_float(value: Any, field: str) -> float:
     return number
 
 
+def _model_version(source: Any) -> str:
+    path = Path(str(source))
+    digest = hashlib.sha256()
+    if path.is_file():
+        files = [path]
+    elif path.is_dir():
+        files = sorted(
+            item for item in path.rglob("*")
+            if item.is_file() and item.suffix.lower() in {".json", ".safetensors", ".bin", ".pt"}
+        )
+    else:
+        return f"kronos:{path.name or str(source)}"
+    for file_path in files:
+        digest.update(str(file_path.relative_to(path if path.is_dir() else path.parent)).encode())
+        with file_path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return f"kronos:{path.name}:{digest.hexdigest()[:12]}"
+
+
 def _history_frame(rows: Any, lookback: int) -> pd.DataFrame:
     if not isinstance(rows, list) or len(rows) < lookback:
         raise ValueError(f"history requires at least {lookback} rows")
@@ -143,6 +170,8 @@ def _history_frame(rows: Any, lookback: int) -> pd.DataFrame:
         raise ValueError("history contains invalid numeric values")
     if (frame[_REQUIRED_PRICE_COLS] <= 0).any().any():
         raise ValueError("history OHLC must be positive")
+    if (frame[["volume", "amount"]] < 0).any().any():
+        raise ValueError("history volume and amount must be non-negative")
     return frame
 
 
@@ -160,10 +189,14 @@ def _future_index(values: Any, days: int, last_date: pd.Timestamp) -> pd.Datetim
 def _sanitize_predictions(frame: pd.DataFrame) -> list[dict[str, Any]]:
     predictions = []
     for timestamp, row in frame.iterrows():
-        open_price = max(_finite_float(row["open"], "open"), 0.0001)
-        close_price = max(_finite_float(row["close"], "close"), 0.0001)
-        high = max(_finite_float(row["high"], "high"), open_price, close_price)
-        low = max(min(_finite_float(row["low"], "low"), open_price, close_price), 0.0001)
+        open_price = _finite_float(row["open"], "open")
+        close_price = _finite_float(row["close"], "close")
+        raw_high = _finite_float(row["high"], "high")
+        raw_low = _finite_float(row["low"], "low")
+        if min(open_price, raw_high, raw_low, close_price) <= 0:
+            raise ValueError("predicted OHLC must be positive")
+        high = max(raw_high, open_price, close_price)
+        low = min(raw_low, open_price, close_price)
         predictions.append({
             "date": pd.Timestamp(timestamp).strftime("%Y-%m-%d"),
             "open": round(open_price, 4),
@@ -211,6 +244,10 @@ class C1Enhancer:
             return
         with manifest_path.open(encoding="utf-8") as file:
             manifest = json.load(file)
+        if manifest.get("approved") is not True and not self.allow_unvalidated:
+            self._manifest = manifest
+            self.blocked_reason = "approval_gate_failed:approved_is_not_true"
+            return
         test_ic = float(manifest.get("metrics", {}).get("test", {}).get("IC_by_date", float("-inf")))
         if test_ic < self.min_test_ic and not self.allow_unvalidated:
             self._manifest = manifest
@@ -332,6 +369,13 @@ class LocalKpredEngine:
         self.device = _setting(
             self.config, "model", "device", "KRONOS_DEVICE", None, str
         ) or None
+        self.max_concurrency = max(1, min(32, _setting(
+            self.config, "service", "max_concurrency", "KRONOS_MAX_CONCURRENCY", 1, int
+        )))
+        self.queue_timeout = max(0.0, min(600.0, _setting(
+            self.config, "service", "queue_timeout", "KRONOS_QUEUE_TIMEOUT", 5.0, float
+        )))
+        self._admission = BoundedSemaphore(self.max_concurrency)
         self._lock = Lock()
         started = time.perf_counter()
         if predictor is None:
@@ -351,6 +395,8 @@ class LocalKpredEngine:
         predictor.clip = self.clip
         self.predictor = predictor
         self.model_meta = model_meta or {"predictor": {"provider": "injected", "source": "test"}}
+        source = self.model_meta.get("predictor", {}).get("source", "Kronos")
+        self.model_version = _model_version(source)
         self.load_seconds = time.perf_counter() - started
         self.c1 = C1Enhancer(self.config)
 
@@ -359,12 +405,15 @@ class LocalKpredEngine:
             "status": "ok",
             "model_ready": self.predictor is not None,
             "model": self.model_meta,
+            "model_version": self.model_version,
             "load_seconds": round(self.load_seconds, 3),
             "max_context": self.max_context,
             "lookback": self.lookback,
             "max_pred_days": self.max_pred_days,
             "evaluation_horizons": list(self.evaluation_horizons),
             "sample_count": self.sample_count,
+            "max_concurrency": self.max_concurrency,
+            "queue_timeout": self.queue_timeout,
             "temperature": self.temperature,
             "top_k": self.top_k,
             "top_p": self.top_p,
@@ -386,23 +435,27 @@ class LocalKpredEngine:
         last_date = pd.Timestamp(history["date"].iloc[-1])
         future = _future_index(payload.get("future_timestamps"), days, last_date)
         model_input = history[[*_REQUIRED_PRICE_COLS, "volume", "amount"]]
-        with self._lock:
-            predicted = self.predictor.predict(
-                model_input,
-                history["date"].reset_index(drop=True),
-                pd.Series(future),
-                days,
-                T=self.temperature,
-                top_k=self.top_k,
-                top_p=self.top_p,
-                sample_count=self.sample_count,
-                verbose=False,
-            )
+        if not self._admission.acquire(timeout=self.queue_timeout):
+            raise InferenceBusyError("inference queue is full")
+        try:
+            with self._lock:
+                predicted = self.predictor.predict(
+                    model_input,
+                    history["date"].reset_index(drop=True),
+                    pd.Series(future),
+                    days,
+                    T=self.temperature,
+                    top_k=self.top_k,
+                    top_p=self.top_p,
+                    sample_count=self.sample_count,
+                    verbose=False,
+                )
+        finally:
+            self._admission.release()
         predictions = _sanitize_predictions(predicted)
         last_close = float(history["close"].iloc[-1])
         kronos_return = predictions[-1]["close"] / last_close - 1.0
         pro, c1_status = self.c1.score(symbol, last_date, days, kronos_return, predictions)
-        source = self.model_meta.get("predictor", {}).get("source", "Kronos")
         return {
             "symbol": symbol,
             "name": payload.get("name") or symbol,
@@ -411,7 +464,7 @@ class LocalKpredEngine:
             "predictions": predictions,
             "pro": pro,
             "provider": "local",
-            "model_version": f"kronos:{Path(str(source)).name}",
+            "model_version": self.model_version,
             "history_last_date": str(last_date.date()),
             "prediction_start_date": predictions[0]["date"],
             "evaluation_horizons": [
@@ -448,6 +501,8 @@ class _Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             self._write_json(200, self.engine.predict(payload))
+        except InferenceBusyError as exc:
+            self._write_json(503, {"code": -1, "msg": str(exc), "error_code": "INFERENCE_BUSY"})
         except ValueError as exc:
             self._write_json(400, {"code": -1, "msg": str(exc), "error_code": "INVALID_ARGUMENT"})
         except Exception as exc:  # noqa: BLE001

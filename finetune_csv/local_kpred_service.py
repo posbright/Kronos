@@ -145,6 +145,19 @@ def _model_version(source: Any) -> str:
     return f"kronos:{path.name}:{digest.hexdigest()[:12]}"
 
 
+def _artifact_versions(model_meta: dict[str, Any]) -> tuple[str, str, str]:
+    predictor_source = model_meta.get("predictor", {}).get("source", "Kronos")
+    tokenizer_source = model_meta.get("tokenizer", {}).get("source")
+    predictor_version = _model_version(predictor_source)
+    tokenizer_version = (
+        _model_version(tokenizer_source) if tokenizer_source else "kronos:tokenizer:unknown"
+    )
+    digest = hashlib.sha256(
+        f"{predictor_version}|{tokenizer_version}".encode("utf-8")
+    ).hexdigest()[:12]
+    return predictor_version, tokenizer_version, f"kronos:bundle:{digest}"
+
+
 def _history_frame(rows: Any, lookback: int) -> pd.DataFrame:
     if not isinstance(rows, list) or len(rows) < lookback:
         raise ValueError(f"history requires at least {lookback} rows")
@@ -395,8 +408,9 @@ class LocalKpredEngine:
         predictor.clip = self.clip
         self.predictor = predictor
         self.model_meta = model_meta or {"predictor": {"provider": "injected", "source": "test"}}
-        source = self.model_meta.get("predictor", {}).get("source", "Kronos")
-        self.model_version = _model_version(source)
+        (self.predictor_version,
+         self.tokenizer_version,
+         self.model_version) = _artifact_versions(self.model_meta)
         self.load_seconds = time.perf_counter() - started
         self.c1 = C1Enhancer(self.config)
 
@@ -406,6 +420,8 @@ class LocalKpredEngine:
             "model_ready": self.predictor is not None,
             "model": self.model_meta,
             "model_version": self.model_version,
+            "predictor_version": self.predictor_version,
+            "tokenizer_version": self.tokenizer_version,
             "load_seconds": round(self.load_seconds, 3),
             "max_context": self.max_context,
             "lookback": self.lookback,
@@ -431,7 +447,10 @@ class LocalKpredEngine:
             raise ValueError(
                 f"days must be one of {list(self.evaluation_horizons)}"
             )
-        history = _history_frame(payload.get("history"), self.lookback)
+        lookback = int(payload.get("lookback", self.lookback))
+        if lookback < 32 or lookback > self.max_context:
+            raise ValueError(f"lookback must be within 32..{self.max_context}")
+        history = _history_frame(payload.get("history"), lookback)
         last_date = pd.Timestamp(history["date"].iloc[-1])
         future = _future_index(payload.get("future_timestamps"), days, last_date)
         model_input = history[[*_REQUIRED_PRICE_COLS, "volume", "amount"]]
@@ -465,6 +484,9 @@ class LocalKpredEngine:
             "pro": pro,
             "provider": "local",
             "model_version": self.model_version,
+            "predictor_version": self.predictor_version,
+            "tokenizer_version": self.tokenizer_version,
+            "lookback": lookback,
             "history_last_date": str(last_date.date()),
             "prediction_start_date": predictions[0]["date"],
             "evaluation_horizons": [

@@ -132,7 +132,70 @@ class LocalKpredServiceTest(unittest.TestCase):
             second = updated_engine.predict(_payload())["model_version"]
 
         self.assertNotEqual(first, second)
-        self.assertRegex(second, r"^kronos:.*:[0-9a-f]{12}$")
+        self.assertRegex(second, r"^kronos:bundle:[0-9a-f]{12}$")
+
+    def test_model_version_includes_tokenizer_contents(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                mock.patch.dict(os.environ, {"KRONOS_LOOKBACK": ""}, clear=False):
+            root = Path(temp_dir)
+            predictor_dir = root / "predictor"
+            tokenizer_dir = root / "tokenizer"
+            predictor_dir.mkdir()
+            tokenizer_dir.mkdir()
+            (predictor_dir / "model.safetensors").write_bytes(b"predictor")
+            tokenizer_weight = tokenizer_dir / "model.safetensors"
+            tokenizer_weight.write_bytes(b"tokenizer-first")
+            meta = {
+                "predictor": {"source": str(predictor_dir)},
+                "tokenizer": {"source": str(tokenizer_dir)},
+            }
+            first = LocalKpredEngine(
+                _FakePredictor(), model_meta=meta,
+                config={"inference": {"lookback": 90}, "c1": {"enabled": False}},
+            ).health()
+            tokenizer_weight.write_bytes(b"tokenizer-second")
+            second = LocalKpredEngine(
+                _FakePredictor(), model_meta=meta,
+                config={"inference": {"lookback": 90}, "c1": {"enabled": False}},
+            ).health()
+
+        self.assertEqual(first["predictor_version"], second["predictor_version"])
+        self.assertNotEqual(first["tokenizer_version"], second["tokenizer_version"])
+        self.assertNotEqual(first["model_version"], second["model_version"])
+
+    def test_request_can_override_lookback_within_max_context(self):
+        predictor = _FakePredictor()
+        predictor.predict = mock.Mock(wraps=predictor.predict)
+        engine = LocalKpredEngine(
+            predictor,
+            config={
+                "model": {"max_context": 128},
+                "inference": {"lookback": 90},
+                "c1": {"enabled": False},
+            },
+        )
+        payload = _payload()
+        payload["lookback"] = 64
+
+        result = engine.predict(payload)
+
+        self.assertEqual(result["lookback"], 64)
+        self.assertEqual(len(predictor.predict.call_args.args[0]), 64)
+
+    def test_request_rejects_lookback_above_max_context(self):
+        engine = LocalKpredEngine(
+            _FakePredictor(),
+            config={
+                "model": {"max_context": 128},
+                "inference": {"lookback": 90},
+                "c1": {"enabled": False},
+            },
+        )
+        payload = _payload()
+        payload["lookback"] = 256
+
+        with self.assertRaisesRegex(ValueError, "lookback must be within 32..128"):
+            engine.predict(payload)
 
     def test_engine_sanitizes_predictions_and_keeps_c1_optional(self):
         with mock.patch.dict(os.environ, {

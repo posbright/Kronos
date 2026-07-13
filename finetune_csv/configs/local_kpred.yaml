@@ -1,0 +1,30 @@
+service:
+  host: 127.0.0.1
+  port: 18081
+
+model:
+  # 相对路径统一以 Kronos 仓库根目录解析，Windows/Linux 均可直接使用。
+  tokenizer: model/pretrained/Kronos-Tokenizer-base
+  predictor: model/pretrained/Kronos-base
+  device: cpu
+  max_context: 512
+
+inference:
+  # 生产默认：仓库 30 步回归中 lookback=256 优于 512；页面只开放 3/5/10 日。
+  # 若启用现有 C1，C1 自身仍按训练时的 lookback=90、horizon=5 解释。
+  lookback: 256
+  max_pred_days: 10
+  sample_count: 1
+  temperature: 1.0
+  # top_k=1 为贪心生成，可复现，适合服务缓存；研究随机路径时再改为 0/0.9。
+  top_k: 1
+  top_p: 1.0
+  clip: 5.0
+
+c1:
+  enabled: false
+  bundle: runs/dataC_c1
+  features_csv: DataSet/dataC/fusion_all.csv
+  min_test_ic: 0.0
+  max_feature_age_days: 7
+  allow_unvalidated: false

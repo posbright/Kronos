@@ -182,6 +182,97 @@ class LocalKpredServiceTest(unittest.TestCase):
         self.assertEqual(result["lookback"], 64)
         self.assertEqual(len(predictor.predict.call_args.args[0]), 64)
 
+    def test_request_can_override_sampling_parameters(self):
+        predictor = _FakePredictor()
+        predictor.predict = mock.Mock(wraps=predictor.predict)
+        engine = LocalKpredEngine(
+            predictor,
+            config={
+                "inference": {
+                    "lookback": 90, "sample_count": 1, "temperature": 1.0,
+                    "top_k": 1, "top_p": 1.0, "clip": 5.0,
+                },
+                "c1": {"enabled": False},
+            },
+        )
+        payload = _payload()
+        payload.update({
+            "sample_count": 10, "temperature": 0.7, "top_k": 0,
+            "top_p": 0.85, "clip": 4.0,
+        })
+
+        result = engine.predict(payload)
+
+        kwargs = predictor.predict.call_args.kwargs
+        self.assertEqual(kwargs["sample_count"], 10)
+        self.assertEqual(kwargs["T"], 0.7)
+        self.assertEqual(kwargs["top_k"], 0)
+        self.assertEqual(kwargs["top_p"], 0.85)
+        self.assertEqual(engine.predictor.clip, 4.0)
+        self.assertEqual(result["sample_count"], 10)
+        self.assertEqual(result["temperature"], 0.7)
+        self.assertEqual(result["top_p"], 0.85)
+        self.assertEqual(result["clip"], 4.0)
+
+    def test_request_sampling_overrides_are_clamped_to_bounds(self):
+        predictor = _FakePredictor()
+        predictor.predict = mock.Mock(wraps=predictor.predict)
+        engine = LocalKpredEngine(
+            predictor,
+            config={"inference": {"lookback": 90}, "c1": {"enabled": False}},
+        )
+        payload = _payload()
+        payload.update({
+            "sample_count": 999, "temperature": 50.0, "top_k": -5,
+            "top_p": 5.0, "clip": 0.1,
+        })
+
+        result = engine.predict(payload)
+
+        self.assertEqual(result["sample_count"], 64)
+        self.assertEqual(result["temperature"], 5.0)
+        self.assertEqual(result["top_k"], 0)
+        self.assertEqual(result["top_p"], 1.0)
+        self.assertEqual(result["clip"], 1.0)
+
+    def test_request_rejects_non_finite_or_null_sampling_parameters(self):
+        engine = LocalKpredEngine(
+            _FakePredictor(),
+            config={"inference": {"lookback": 90}, "c1": {"enabled": False}},
+        )
+
+        for field, value in (
+            ("temperature", float("nan")), ("clip", None), ("sample_count", 1.5),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = _payload()
+                payload[field] = value
+                with self.assertRaisesRegex(ValueError, field):
+                    engine.predict(payload)
+
+    def test_request_without_sampling_overrides_uses_service_defaults(self):
+        predictor = _FakePredictor()
+        predictor.predict = mock.Mock(wraps=predictor.predict)
+        engine = LocalKpredEngine(
+            predictor,
+            config={
+                "inference": {
+                    "lookback": 90, "sample_count": 3, "temperature": 0.9,
+                    "top_k": 2, "top_p": 0.8, "clip": 6.0,
+                },
+                "c1": {"enabled": False},
+            },
+        )
+
+        result = engine.predict(_payload())
+
+        kwargs = predictor.predict.call_args.kwargs
+        self.assertEqual(kwargs["sample_count"], 3)
+        self.assertEqual(kwargs["T"], 0.9)
+        self.assertEqual(kwargs["top_k"], 2)
+        self.assertEqual(kwargs["top_p"], 0.8)
+        self.assertEqual(result["clip"], 6.0)
+
     def test_request_rejects_lookback_above_max_context(self):
         engine = LocalKpredEngine(
             _FakePredictor(),

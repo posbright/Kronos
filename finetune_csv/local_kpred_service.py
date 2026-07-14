@@ -115,6 +115,10 @@ def _horizon_setting(config: dict[str, Any], max_pred_days: int) -> tuple[int, .
     return horizons
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
 def _finite_float(value: Any, field: str) -> float:
     try:
         number = float(value)
@@ -123,6 +127,13 @@ def _finite_float(value: Any, field: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{field} must be finite")
     return number
+
+
+def _bounded_integer(value: Any, field: str, lo: int, hi: int) -> int:
+    number = _finite_float(value, field)
+    if not number.is_integer():
+        raise ValueError(f"{field} must be an integer")
+    return int(_clamp(number, lo, hi))
 
 
 def _model_version(source: Any) -> str:
@@ -450,6 +461,17 @@ class LocalKpredEngine:
         lookback = int(payload.get("lookback", self.lookback))
         if lookback < 32 or lookback > self.max_context:
             raise ValueError(f"lookback must be within 32..{self.max_context}")
+        sample_count = _bounded_integer(
+            payload.get("sample_count", self.sample_count), "sample_count", 1, 64
+        )
+        temperature = _clamp(_finite_float(
+            payload.get("temperature", self.temperature), "temperature"
+        ), 0.05, 5.0)
+        top_k = _bounded_integer(payload.get("top_k", self.top_k), "top_k", 0, 1024)
+        top_p = _clamp(_finite_float(
+            payload.get("top_p", self.top_p), "top_p"
+        ), 0.01, 1.0)
+        clip = _clamp(_finite_float(payload.get("clip", self.clip), "clip"), 1.0, 20.0)
         history = _history_frame(payload.get("history"), lookback)
         last_date = pd.Timestamp(history["date"].iloc[-1])
         future = _future_index(payload.get("future_timestamps"), days, last_date)
@@ -458,15 +480,16 @@ class LocalKpredEngine:
             raise InferenceBusyError("inference queue is full")
         try:
             with self._lock:
+                self.predictor.clip = clip
                 predicted = self.predictor.predict(
                     model_input,
                     history["date"].reset_index(drop=True),
                     pd.Series(future),
                     days,
-                    T=self.temperature,
-                    top_k=self.top_k,
-                    top_p=self.top_p,
-                    sample_count=self.sample_count,
+                    T=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_count=sample_count,
                     verbose=False,
                 )
         finally:
@@ -487,6 +510,11 @@ class LocalKpredEngine:
             "predictor_version": self.predictor_version,
             "tokenizer_version": self.tokenizer_version,
             "lookback": lookback,
+            "sample_count": sample_count,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "clip": clip,
             "history_last_date": str(last_date.date()),
             "prediction_start_date": predictions[0]["date"],
             "evaluation_horizons": [

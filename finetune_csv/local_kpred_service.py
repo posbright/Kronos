@@ -156,7 +156,17 @@ def _model_version(source: Any) -> str:
     return f"kronos:{path.name}:{digest.hexdigest()[:12]}"
 
 
-def _artifact_versions(model_meta: dict[str, Any]) -> tuple[str, str, str]:
+def _runtime_version(sample_batch_size: int) -> str:
+    digest = hashlib.sha256(f"sample_batch_size={sample_batch_size}".encode("utf-8"))
+    for source in (Path(__file__), _REPO_ROOT / "model" / "kronos.py"):
+        digest.update(source.name.encode("utf-8"))
+        digest.update(source.read_bytes())
+    return f"kronos:runtime:{digest.hexdigest()[:12]}"
+
+
+def _artifact_versions(
+    model_meta: dict[str, Any], runtime_version: str,
+) -> tuple[str, str, str]:
     predictor_source = model_meta.get("predictor", {}).get("source", "Kronos")
     tokenizer_source = model_meta.get("tokenizer", {}).get("source")
     predictor_version = _model_version(predictor_source)
@@ -164,7 +174,7 @@ def _artifact_versions(model_meta: dict[str, Any]) -> tuple[str, str, str]:
         _model_version(tokenizer_source) if tokenizer_source else "kronos:tokenizer:unknown"
     )
     digest = hashlib.sha256(
-        f"{predictor_version}|{tokenizer_version}".encode("utf-8")
+        f"{predictor_version}|{tokenizer_version}|{runtime_version}".encode("utf-8")
     ).hexdigest()[:12]
     return predictor_version, tokenizer_version, f"kronos:bundle:{digest}"
 
@@ -378,6 +388,10 @@ class LocalKpredEngine:
         self.sample_count = max(1, min(64, _setting(
             self.config, "inference", "sample_count", "KRONOS_SAMPLE_COUNT", 1, int
         )))
+        self.sample_batch_size = max(1, min(64, _setting(
+            self.config, "inference", "sample_batch_size",
+            "KRONOS_SAMPLE_BATCH_SIZE", 5, int
+        )))
         self.temperature = max(0.05, min(5.0, _setting(
             self.config, "inference", "temperature", "KRONOS_TEMPERATURE", 1.0, float
         )))
@@ -414,14 +428,17 @@ class LocalKpredEngine:
                 ),
                 device=self.device,
                 max_context=self.max_context,
+                sample_batch_size=self.sample_batch_size,
                 verbose=True,
             )
+        predictor.sample_batch_size = self.sample_batch_size
         predictor.clip = self.clip
         self.predictor = predictor
         self.model_meta = model_meta or {"predictor": {"provider": "injected", "source": "test"}}
+        self.runtime_version = _runtime_version(self.sample_batch_size)
         (self.predictor_version,
          self.tokenizer_version,
-         self.model_version) = _artifact_versions(self.model_meta)
+         self.model_version) = _artifact_versions(self.model_meta, self.runtime_version)
         self.load_seconds = time.perf_counter() - started
         self.c1 = C1Enhancer(self.config)
 
@@ -433,12 +450,14 @@ class LocalKpredEngine:
             "model_version": self.model_version,
             "predictor_version": self.predictor_version,
             "tokenizer_version": self.tokenizer_version,
+            "runtime_version": self.runtime_version,
             "load_seconds": round(self.load_seconds, 3),
             "max_context": self.max_context,
             "lookback": self.lookback,
             "max_pred_days": self.max_pred_days,
             "evaluation_horizons": list(self.evaluation_horizons),
             "sample_count": self.sample_count,
+            "sample_batch_size": self.sample_batch_size,
             "max_concurrency": self.max_concurrency,
             "queue_timeout": self.queue_timeout,
             "temperature": self.temperature,
@@ -509,6 +528,7 @@ class LocalKpredEngine:
             "model_version": self.model_version,
             "predictor_version": self.predictor_version,
             "tokenizer_version": self.tokenizer_version,
+            "runtime_version": self.runtime_version,
             "lookback": lookback,
             "sample_count": sample_count,
             "temperature": temperature,

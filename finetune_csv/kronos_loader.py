@@ -87,6 +87,7 @@ def _load_one(loader_cls, src: str, asset: str, prefer_source: str, verbose: boo
 
 def load_kronos_predictor(*, tokenizer_src: str, predictor_src: str,
                           device=None, max_context: int = 512,
+                          sample_batch_size: int = 0,
                           prefer_source: str = "modelscope", verbose: bool = True):
     """Load tokenizer/model with source fallback and build KronosPredictor.
 
@@ -103,7 +104,10 @@ def load_kronos_predictor(*, tokenizer_src: str, predictor_src: str,
         Kronos, predictor_src, asset="predictor",
         prefer_source=prefer_source, verbose=verbose,
     )
-    predictor = KronosPredictor(mdl, tok, device=device, max_context=max_context)
+    predictor = KronosPredictor(
+        mdl, tok, device=device, max_context=max_context,
+        sample_batch_size=sample_batch_size,
+    )
     meta = {
         "prefer_source": (prefer_source or "modelscope").strip().lower(),
         "tokenizer": tok_meta,

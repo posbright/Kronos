@@ -477,7 +477,7 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         滑动缓冲区 pre_buffer/post_buffer；每步先采样 s1 再采样 s2；最后解码并对
         多条路径取均值返回。
     """
-    with torch.no_grad():
+    with torch.inference_mode():
         x = torch.clip(x, -clip, clip)  # 裁剪异常值
 
         device = x.device
@@ -587,11 +587,13 @@ class KronosPredictor:
     → 自回归推理 → 反归一化 → 组装 DataFrame」的完整预测流程。
     """
 
-    def __init__(self, model, tokenizer, device=None, max_context=512, clip=5):
+    def __init__(self, model, tokenizer, device=None, max_context=512, clip=5,
+                 sample_batch_size=0):
         self.tokenizer = tokenizer
         self.model = model
         self.max_context = max_context
         self.clip = clip
+        self.sample_batch_size = max(0, int(sample_batch_size))
         self.price_cols = ['open', 'high', 'low', 'close']  # 价格列（必需）
         self.vol_col = 'volume'   # 成交量列
         self.amt_vol = 'amount'   # 成交额列
@@ -617,8 +619,29 @@ class KronosPredictor:
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
-        preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
+        batch_size = self.sample_batch_size or sample_count
+        if sample_count <= batch_size:
+            preds = auto_regressive_inference(
+                self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor,
+                self.max_context, pred_len, self.clip, T, top_k, top_p,
+                sample_count, verbose,
+            )
+        else:
+            weighted_sum = None
+            remaining = sample_count
+            while remaining > 0:
+                chunk_size = min(batch_size, remaining)
+                chunk = auto_regressive_inference(
+                    self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor,
+                    self.max_context, pred_len, self.clip, T, top_k, top_p,
+                    chunk_size, verbose,
+                )
+                weighted_sum = (
+                    chunk * chunk_size if weighted_sum is None
+                    else weighted_sum + chunk * chunk_size
+                )
+                remaining -= chunk_size
+            preds = weighted_sum / sample_count
         preds = preds[:, -pred_len:, :]  # 仅保留最后 pred_len 步的预测
         return preds
 

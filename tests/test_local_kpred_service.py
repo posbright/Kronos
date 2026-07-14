@@ -79,6 +79,28 @@ class LocalKpredServiceTest(unittest.TestCase):
         self.assertFalse(predictor.model.training)
         self.assertFalse(predictor.tokenizer.training)
 
+    def test_kronos_predictor_chunks_sample_paths_with_weighted_mean(self):
+        from model.kronos import KronosPredictor
+
+        predictor = KronosPredictor(
+            _ModeModule(), _ModeModule(), device="cpu", sample_batch_size=5,
+        )
+        generated = []
+
+        def fake_inference(*args, **kwargs):
+            chunk_size = args[-2]
+            generated.append(chunk_size)
+            return torch.full((1, 3, 6), float(chunk_size)).numpy()
+
+        with mock.patch("model.kronos.auto_regressive_inference", side_effect=fake_inference):
+            result = predictor.generate(
+                [[[1.0] * 6] * 32], [[[1.0] * 5] * 32], [[[1.0] * 5] * 3],
+                3, 1.0, 0, 0.85, 12, False,
+            )
+
+        self.assertEqual(generated, [5, 5, 2])
+        self.assertTrue((result == 4.5).all())
+
     def test_yaml_config_controls_inference_limits(self):
         config = _load_config(ROOT / "finetune_csv" / "configs" / "local_kpred.yaml")
         config["model"]["max_context"] = 128
@@ -98,6 +120,7 @@ class LocalKpredServiceTest(unittest.TestCase):
         self.assertEqual(engine.lookback, 128)
         self.assertEqual(engine.max_pred_days, 120)
         self.assertEqual(engine.sample_count, 64)
+        self.assertEqual(engine.sample_batch_size, 5)
 
     def test_relative_paths_resolve_from_repository_root(self):
         config = _load_config("finetune_csv/configs/local_kpred.yaml")
@@ -109,6 +132,7 @@ class LocalKpredServiceTest(unittest.TestCase):
         self.assertEqual(engine.evaluation_horizons, (1, 3, 5, 10, 15, 30))
         self.assertEqual(engine.top_k, 1)
         self.assertEqual(engine.top_p, 1.0)
+        self.assertEqual(engine.health()["sample_batch_size"], 5)
         self.assertTrue(engine.health()["model_version"].startswith("kronos:"))
 
     def test_model_version_changes_with_weight_contents(self):
@@ -133,6 +157,25 @@ class LocalKpredServiceTest(unittest.TestCase):
 
         self.assertNotEqual(first, second)
         self.assertRegex(second, r"^kronos:bundle:[0-9a-f]{12}$")
+
+    def test_model_version_includes_sample_batch_size(self):
+        first = LocalKpredEngine(
+            _FakePredictor(),
+            config={
+                "inference": {"lookback": 90, "sample_batch_size": 5},
+                "c1": {"enabled": False},
+            },
+        ).health()
+        second = LocalKpredEngine(
+            _FakePredictor(),
+            config={
+                "inference": {"lookback": 90, "sample_batch_size": 10},
+                "c1": {"enabled": False},
+            },
+        ).health()
+
+        self.assertNotEqual(first["runtime_version"], second["runtime_version"])
+        self.assertNotEqual(first["model_version"], second["model_version"])
 
     def test_model_version_includes_tokenizer_contents(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
